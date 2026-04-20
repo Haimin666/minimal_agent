@@ -1,0 +1,354 @@
+"""Agent 主类 - 接入真实 LLM + 自动记忆"""
+
+from typing import List, Optional, Dict, Any
+import json
+import requests
+from pathlib import Path
+import re
+
+try:
+    from .config import Config
+    from .context import Context
+    from .memory import MemoryManager, MemoryStorage
+    from .memory.embedding import EmbeddingProvider
+    from .prompt import PromptBuilder
+    from .tools.memory_tools import MemorySearchTool, MemoryGetTool, ToolResult
+except ImportError:
+    from config import Config
+    from context import Context
+    from memory import MemoryManager, MemoryStorage
+    from memory.embedding import EmbeddingProvider
+    from prompt import PromptBuilder
+    from tools.memory_tools import MemorySearchTool, MemoryGetTool, ToolResult
+
+
+# 工具定义（OpenAI 格式）
+TOOLS_DEFINITION = [
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_save",
+            "description": "保存重要信息到长期记忆。当用户告诉你关于他/她自己的信息、偏好、背景、重要事件时，应该调用此工具保存。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "要保存的记忆内容，应该简洁明确，例如：'用户是王教授，在清华大学任教'"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "保存原因，例如：'用户更正了个人信息'"
+                    }
+                },
+                "required": ["content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_search",
+            "description": "搜索长期记忆，查找相关信息",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "搜索关键词"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
+
+
+class SimpleAgent:
+    """
+    Agent 实现 - 支持自动记忆
+
+    核心流程:
+    1. 构建系统提示词 (PromptBuilder)
+    2. 搜索相关记忆 (MemoryManager.search)
+    3. 构建消息列表 (Context)
+    4. 调用 LLM API（支持工具调用）
+    5. 执行工具调用（如 memory_save）
+    6. 保存对话历史
+    """
+
+    def __init__(self, config: Config = None, user_id: str = None):
+        self.config = config or Config()
+        self.user_id = user_id
+
+        # 初始化嵌入模型
+        self.embedding_provider = EmbeddingProvider(
+            model=self.config.embedding_model,
+            api_key=self.config.embedding_api_key,
+            api_base=self.config.embedding_api_base,
+            dimensions=self.config.embedding_dimensions
+        )
+
+        self.storage = MemoryStorage(self.config.db_path)
+
+        self.memory_manager = MemoryManager(
+            storage=self.storage,
+            embedding_provider=self.embedding_provider,
+            workspace_dir=self.config.workspace_dir,
+            chunk_max_tokens=self.config.chunk_max_tokens,
+            chunk_overlap_tokens=self.config.chunk_overlap_tokens
+        )
+
+        self.prompt_builder = PromptBuilder(self.config.workspace_dir)
+
+        # 每个用户独立的上下文
+        session_id = f"{user_id}_session" if user_id else "default"
+        self.context = Context(session_id=session_id, user_id=user_id)
+
+        # 工具调用记录
+        self.tool_calls_log = []
+
+        # 确保工作空间存在
+        self._init_workspace()
+
+    def _init_workspace(self):
+        """初始化工作空间"""
+        workspace = Path(self.config.workspace_dir)
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / "memory").mkdir(exist_ok=True)
+
+        # 创建默认文件
+        agent_file = workspace / "AGENT.md"
+        if not agent_file.exists():
+            agent_file.write_text("# AGENT.md\n\n我是 AI 助手。\n", encoding='utf-8')
+
+        memory_file = workspace / "MEMORY.md"
+        if not memory_file.exists():
+            memory_file.write_text("# MEMORY.md\n\n长期记忆索引。\n", encoding='utf-8')
+
+    def chat(self, user_input: str) -> Dict[str, Any]:
+        """
+        处理用户输入
+
+        Returns:
+            {
+                "response": str,           # 助手回复
+                "tool_calls": list,        # 工具调用记录
+                "memories_found": int      # 检索到的记忆数
+            }
+        """
+        self.tool_calls_log = []
+
+        # 1. 构建系统提示词
+        context_files = self.prompt_builder.load_context_files()
+
+        system_prompt = self._build_system_prompt(context_files)
+
+        # 2. 搜索相关记忆
+        memories = self.memory_manager.search(
+            query=user_input,
+            user_id=self.user_id,
+            limit=5,
+            vector_weight=self.config.vector_weight,
+            keyword_weight=self.config.keyword_weight
+        )
+
+        # 3. 构建消息列表
+        messages = [{"role": "system", "content": system_prompt}]
+
+        # 注入记忆上下文
+        if memories:
+            memory_context = "## 相关记忆\n\n"
+            for m in memories[:3]:
+                scope_tag = "共享" if m.scope == "shared" else "私有"
+                memory_context += f"- [{scope_tag}] {m.snippet[:200]}\n"
+            messages.append({"role": "system", "content": memory_context})
+
+        # 添加历史消息
+        messages.extend(self.context.get_openai_messages())
+
+        # 添加当前输入
+        messages.append({"role": "user", "content": user_input})
+
+        # 4. 调用 LLM（支持工具调用）
+        response = self._call_llm_with_tools(messages)
+
+        # 5. 保存历史
+        self.context.add_message("user", user_input)
+        self.context.add_message("assistant", response["content"])
+
+        return {
+            "response": response["content"],
+            "tool_calls": self.tool_calls_log,
+            "memories_found": len(memories)
+        }
+
+    def _build_system_prompt(self, context_files: list) -> str:
+        """构建系统提示词"""
+        from datetime import datetime
+
+        base_prompt = """你是一个智能助手，具有长期记忆能力。
+
+## 记忆能力
+
+你可以通过工具保存和检索记忆：
+- `memory_save`: 保存重要信息到长期记忆
+- `memory_search`: 搜索已有记忆
+
+## 何时保存记忆
+
+当用户告诉你以下信息时，应该主动保存：
+1. 用户的个人信息（姓名、职业、身份等）
+2. 用户的偏好和习惯
+3. 用户更正之前的信息
+4. 用户提到的重要事件或计划
+5. 用户明确要求"记住"的内容
+
+## 保存记忆的格式
+
+保存时内容应该简洁明确，例如：
+- "用户是王教授，在清华大学任教"
+- "用户喜欢听古典音乐"
+- "用户明天要去上海出差"
+
+不要保存：
+- 临时性的对话内容
+- 问候语和闲聊
+- 可以随时查到的常识
+"""
+
+        # 添加上下文文件内容
+        if context_files:
+            base_prompt += "\n\n## 项目上下文\n"
+            for f in context_files:
+                base_prompt += f"\n### {f.path}\n{f.content}\n"
+
+        # 添加运行时信息
+        base_prompt += f"\n\n## 当前状态\n"
+        base_prompt += f"- 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        base_prompt += f"- 用户: {self.user_id or '未指定'}\n"
+
+        return base_prompt
+
+    def _call_llm_with_tools(self, messages: List[Dict]) -> Dict[str, Any]:
+        """调用 LLM 并处理工具调用"""
+        max_iterations = 3  # 最多 3 轮工具调用
+
+        for iteration in range(max_iterations):
+            # 调用 LLM
+            response = requests.post(
+                f"{self.config.api_base}/chat/completions",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.config.api_key}"
+                },
+                json={
+                    "model": self.config.model,
+                    "messages": messages,
+                    "tools": TOOLS_DEFINITION,
+                    "tool_choice": "auto"
+                },
+                timeout=60
+            )
+
+            if response.status_code != 200:
+                raise Exception(f"LLM 调用失败: {response.status_code} - {response.text}")
+
+            result = response.json()
+            message = result["choices"][0]["message"]
+
+            # 检查是否有工具调用
+            if message.get("tool_calls"):
+                # 添加助手消息到历史
+                messages.append(message)
+
+                # 处理每个工具调用
+                for tool_call in message["tool_calls"]:
+                    tool_name = tool_call["function"]["name"]
+                    tool_args = json.loads(tool_call["function"]["arguments"])
+                    tool_call_id = tool_call["id"]
+
+                    # 执行工具
+                    tool_result = self._execute_tool(tool_name, tool_args)
+
+                    # 添加工具结果到消息
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": json.dumps(tool_result, ensure_ascii=False)
+                    })
+
+                # 继续循环，让 LLM 生成最终回复
+                continue
+
+            # 没有工具调用，返回最终回复
+            return {"content": message.get("content", "")}
+
+        # 超过最大迭代次数
+        return {"content": "抱歉，处理过程中出现问题。"}
+
+    def _execute_tool(self, tool_name: str, tool_args: Dict) -> Dict:
+        """执行工具调用"""
+        if tool_name == "memory_save":
+            content = tool_args.get("content", "")
+            reason = tool_args.get("reason", "")
+
+            # 保存记忆
+            path = self.add_memory(content, scope="user")
+
+            self.tool_calls_log.append({
+                "tool": "memory_save",
+                "content": content,
+                "reason": reason,
+                "path": path
+            })
+
+            return {
+                "success": True,
+                "message": f"已保存记忆: {content[:50]}...",
+                "path": path
+            }
+
+        elif tool_name == "memory_search":
+            query = tool_args.get("query", "")
+
+            results = self.memory_manager.search(
+                query=query,
+                user_id=self.user_id,
+                limit=5
+            )
+
+            self.tool_calls_log.append({
+                "tool": "memory_search",
+                "query": query,
+                "results_count": len(results)
+            })
+
+            return {
+                "success": True,
+                "results": [
+                    {
+                        "content": r.snippet[:100],
+                        "path": r.path,
+                        "score": round(r.score, 3)
+                    }
+                    for r in results
+                ]
+            }
+
+        else:
+            return {"success": False, "error": f"未知工具: {tool_name}"}
+
+    def add_memory(self, content: str, path: str = None, scope: str = "user"):
+        """添加记忆"""
+        return self.memory_manager.add_memory(
+            content=content,
+            path=path,
+            user_id=self.user_id,
+            scope=scope
+        )
+
+    def clear_history(self):
+        """清空对话历史"""
+        self.context.clear()
