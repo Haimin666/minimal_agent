@@ -1,4 +1,4 @@
-"""记忆管理器 - 整合分块、嵌入、存储 + 人类可读存储"""
+"""记忆管理器 - 文件 + 向量数据库混合存储"""
 
 from typing import List, Optional, Dict, Any
 from pathlib import Path
@@ -14,27 +14,26 @@ from .embedding import EmbeddingProvider
 
 class MemoryManager:
     """
-    记忆管理器 - 支持用户隔离 + 人类可读存储
+    记忆管理器 - 文件（人类可读）+ 数据库（机器检索）
 
     存储结构：
     workspace/
-    ├── MEMORY.md              # 记忆索引（人类可读）
-    ├── profile/               # 用户画像目录
-    │   └── {user_id}.md       # 用户画像文件
+    ├── MEMORY.md              # 共享长期记忆
     └── memory/
-        ├── shared/            # 共享记忆
+        ├── shared/            # 共享每日记忆
+        │   └── YYYY-MM-DD.md
         └── users/
             └── {user_id}/
-                ├── profile.md     # 用户画像（从 profile/ 同步）
-                └── YYYY-MM-DD.md  # 每日记忆（人类可读文件名）
+                ├── MEMORY.md      # 用户长期记忆
+                └── YYYY-MM-DD.md  # 用户每日记忆
 
-    记忆更新策略：
-    - 当保存新记忆时，搜索相似记忆
-    - 如果相似度 > 0.85，认为是更新，删除旧记忆
-    - 否则作为新记忆追加
+    更新机制：
+    - 新记忆 → 检测相似度
+    - 相似度 > 0.85 → 编辑文件对应行 + 更新向量
+    - 相似度 <= 0.85 → 追加到当日文件末尾 + 新增向量
     """
 
-    # 相似度阈值，超过此值认为是更新
+    # 相似度阈值
     SIMILARITY_THRESHOLD = 0.85
 
     def __init__(
@@ -60,14 +59,11 @@ class MemoryManager:
         (self.memory_dir / "shared").mkdir(exist_ok=True)
         (self.memory_dir / "users").mkdir(exist_ok=True)
 
-        # 用户画像目录
-        self.profile_dir = self.workspace_dir / "profile"
-        self.profile_dir.mkdir(parents=True, exist_ok=True)
+    # ==================== 添加记忆 ====================
 
     def add_memory(
         self,
         content: str,
-        path: str = None,
         user_id: str = None,
         scope: str = "user",
         **metadata
@@ -76,101 +72,69 @@ class MemoryManager:
         添加记忆 - 支持更新模式
 
         Args:
-            content: 记忆内容
-            path: 存储路径 (默认自动生成人类可读的文件名)
-            user_id: 用户 ID (私有记忆必填)
+            content: 记忆内容（单行）
+            user_id: 用户 ID
             scope: 记忆范围 (shared | user)
 
         Returns:
-            生成的路径
+            文件路径
         """
         if not content.strip():
             return None
 
+        # 格式化为一行
+        line_content = content.strip().replace('\n', ' ')
+        if not line_content.startswith('- '):
+            line_content = f"- {line_content}"
+
+        # 获取当日文件路径
+        path = self._get_today_path(user_id, scope)
+
         # 检查是否需要更新（相似记忆存在）
-        if self.embedding_provider and scope == "user" and user_id:
-            similar = self._find_similar_memory(content, user_id)
-            if similar:
-                # 删除旧记忆
-                self._delete_memory_file(similar.path)
-                self.storage.delete_by_path(similar.path)
-
-        # 生成人类可读的路径
-        if not path:
-            path = self._generate_readable_path(content, user_id, scope)
-
-        # 写入文件
-        file_path = self.workspace_dir / path
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding='utf-8')
-
-        # 更新 MEMORY.md 索引
-        self._update_memory_index(path, content, user_id, scope)
-
-        # 分块
-        chunks = self.chunker.chunk_text(content)
-
-        # 生成向量
-        embeddings = None
+        similar = None
         if self.embedding_provider:
-            texts = [c.text for c in chunks]
-            embeddings = self.embedding_provider.embed_batch(texts)
+            similar = self._find_similar_memory(line_content, user_id, scope)
 
-        # 保存到数据库
-        memory_chunks = []
-        for i, chunk in enumerate(chunks):
-            chunk_id = hashlib.md5(f"{path}:{chunk.start_line}:{chunk.end_line}".encode()).hexdigest()
-            embedding = embeddings[i] if embeddings else None
+        if similar:
+            # 更新模式：编辑文件对应行
+            self._edit_memory_line(similar.path, similar.start_line, line_content)
+            # 更新数据库
+            self._update_chunk(similar, line_content)
+            return similar.path
+        else:
+            # 新增模式：追加到文件末尾
+            line_num = self._append_to_file(path, line_content)
+            # 同步到数据库
+            self._sync_single_line(path, line_num, line_content, user_id, scope)
+            return path
 
-            memory_chunks.append(MemoryChunk(
-                id=chunk_id,
-                text=chunk.text,
-                embedding=embedding,
-                path=path,
-                start_line=chunk.start_line,
-                end_line=chunk.end_line,
-                scope=scope,
-                user_id=user_id if scope == "user" else None,
-                metadata={**metadata}
-            ))
-
-        self.storage.save_chunks_batch(memory_chunks)
-
-        return path
-
-    def _generate_readable_path(self, content: str, user_id: str, scope: str) -> str:
-        """
-        生成人类可读的文件路径
-
-        格式:
-        - 共享: memory/shared/YYYY-MM-DD.md
-        - 用户: memory/users/{user_id}/YYYY-MM-DD.md
-        """
+    def _get_today_path(self, user_id: str, scope: str) -> str:
+        """获取当日文件路径"""
         today = datetime.now().strftime("%Y-%m-%d")
 
         if scope == "shared":
-            dir_path = self.memory_dir / "shared"
-            dir_path.mkdir(parents=True, exist_ok=True)
-            base_path = f"memory/shared/{today}.md"
+            return f"memory/shared/{today}.md"
         else:
-            dir_path = self.memory_dir / "users" / (user_id or "default")
-            dir_path.mkdir(parents=True, exist_ok=True)
-            base_path = f"memory/users/{user_id}/{today}.md"
+            return f"memory/users/{user_id}/{today}.md"
 
-        return base_path
-
-    def _find_similar_memory(self, content: str, user_id: str) -> Optional[SearchResult]:
-        """查找相似记忆，用于判断是否需要更新"""
+    def _find_similar_memory(
+        self,
+        content: str,
+        user_id: str,
+        scope: str
+    ) -> Optional[SearchResult]:
+        """查找相似记忆"""
         if not self.embedding_provider:
             return None
 
         query_embedding = self.embedding_provider.embed(content)
-        results = self.storage.search_hybrid_for_user(
-            query=content,
+        scopes = ["user"] if scope == "user" else ["shared"]
+
+        results = self.storage.search_vector(
             query_embedding=query_embedding,
-            user_id=user_id,
-            limit=5,
-            include_shared=False  # 只搜索用户私有记忆
+            user_id=user_id if scope == "user" else None,
+            scopes=scopes,
+            limit=5
         )
 
         for r in results:
@@ -179,127 +143,139 @@ class MemoryManager:
 
         return None
 
-    def _delete_memory_file(self, path: str):
-        """删除记忆文件"""
+    def _append_to_file(self, path: str, line_content: str) -> int:
+        """追加一行到文件，返回行号"""
+        file_path = self.workspace_dir / path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if file_path.exists():
+            content = file_path.read_text(encoding='utf-8')
+            lines = content.split('\n')
+            # 找到最后一个非空行
+            last_line = len(lines)
+            for i in range(len(lines) - 1, -1, -1):
+                if lines[i].strip():
+                    last_line = i + 1
+                    break
+
+            # 追加
+            new_content = content.rstrip('\n') + '\n' + line_content + '\n'
+            file_path.write_text(new_content, encoding='utf-8')
+            return last_line + 1
+        else:
+            # 新文件
+            today = datetime.now().strftime("%Y-%m-%d")
+            header = f"# Daily Memory: {today}\n\n"
+            file_path.write_text(header + line_content + '\n', encoding='utf-8')
+            return 3  # 第3行开始（标题 + 空行）
+
+    def _edit_memory_line(self, path: str, line_num: int, new_content: str):
+        """编辑文件指定行"""
         file_path = self.workspace_dir / path
         if not file_path.exists():
             return
-        file_path.unlink()
 
-    def _update_memory_index(self, path: str, content: str, user_id: str, scope: str):
-        """更新 MEMORY.md 索引文件"""
-        index_file = self.workspace_dir / "MEMORY.md"
+        lines = file_path.read_text(encoding='utf-8').split('\n')
+        if 0 < line_num <= len(lines):
+            lines[line_num - 1] = new_content
+            file_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
-        if index_file.exists():
-            index_content = index_file.read_text(encoding='utf-8')
-        else:
-            index_content = "# 记忆索引\n\n自动维护的记忆索引。\n\n"
+    def _sync_single_line(
+        self,
+        path: str,
+        line_num: int,
+        content: str,
+        user_id: str,
+        scope: str
+    ):
+        """同步单行到数据库"""
+        chunk_id = hashlib.md5(f"{path}:{line_num}".encode()).hexdigest()
+        content_hash = MemoryStorage.compute_hash(content)
 
-        # 检查是否已存在
-        if path in index_content:
+        # 生成向量
+        embedding = None
+        if self.embedding_provider:
+            embedding = self.embedding_provider.embed(content)
+
+        chunk = MemoryChunk(
+            id=chunk_id,
+            text=content,
+            embedding=embedding,
+            path=path,
+            start_line=line_num,
+            end_line=line_num,
+            scope=scope,
+            user_id=user_id if scope == "user" else None,
+            hash=content_hash
+        )
+
+        self.storage.save_chunk(chunk)
+
+        # 更新文件 hash
+        file_path = self.workspace_dir / path
+        if file_path.exists():
+            file_hash = MemoryStorage.compute_hash(file_path.read_text(encoding='utf-8'))
+            stat = file_path.stat()
+            self.storage.update_file_hash(path, file_hash, int(stat.st_mtime), stat.st_size)
+
+    def _update_chunk(self, similar: SearchResult, new_content: str):
+        """更新数据库中的块"""
+        content_hash = MemoryStorage.compute_hash(new_content)
+
+        # 获取 chunk
+        chunk = self.storage.get_chunk_by_path_line(similar.path, similar.start_line)
+        if not chunk:
             return
 
-        # 添加新条目
-        today = datetime.now().strftime("%Y-%m-%d %H:%M")
-        scope_tag = "共享" if scope == "shared" else f"用户({user_id})"
-        summary = content[:50].replace('\n', ' ')
+        # 更新文本
+        self.storage.update_chunk_text(chunk.id, new_content, content_hash)
 
-        new_entry = f"\n## [{today}] {scope_tag}\n- 文件: `{path}`\n- 内容: {summary}...\n"
+        # 更新向量
+        if self.embedding_provider:
+            embedding = self.embedding_provider.embed(new_content)
+            self.storage.update_chunk_embedding(chunk.id, embedding)
 
-        index_file.write_text(index_content + new_entry, encoding='utf-8')
+        # 更新文件 hash
+        file_path = self.workspace_dir / similar.path
+        if file_path.exists():
+            file_hash = MemoryStorage.compute_hash(file_path.read_text(encoding='utf-8'))
+            stat = file_path.stat()
+            self.storage.update_file_hash(similar.path, file_hash, int(stat.st_mtime), stat.st_size)
 
-    def load_user_profile(self, user_id: str) -> Optional[str]:
-        """
-        加载用户画像
-
-        查找顺序：
-        1. workspace/profile/{user_id}.md
-        2. workspace/memory/users/{user_id}/profile.md
-        """
-        # 优先查找 profile 目录
-        profile_file = self.profile_dir / f"{user_id}.md"
-        if profile_file.exists():
-            return profile_file.read_text(encoding='utf-8')
-
-        # 其次查找 memory 目录
-        profile_file = self.memory_dir / "users" / user_id / "profile.md"
-        if profile_file.exists():
-            return profile_file.read_text(encoding='utf-8')
-
-        return None
-
-    def scan_profiles(self) -> Dict[str, str]:
-        """
-        扫描所有用户画像
-
-        Returns:
-            {user_id: profile_content}
-        """
-        profiles = {}
-
-        # 扫描 profile 目录
-        for profile_file in self.profile_dir.glob("*.md"):
-            user_id = profile_file.stem
-            profiles[user_id] = profile_file.read_text(encoding='utf-8')
-
-        return profiles
+    # ==================== 搜索记忆 ====================
 
     def search(
         self,
         query: str,
         user_id: str = None,
         limit: int = 10,
-        vector_weight: float = 0.7,
-        keyword_weight: float = 0.3,
         include_shared: bool = True
     ) -> List[SearchResult]:
         """
-        搜索记忆 - 支持用户隔离
+        搜索记忆
 
         Args:
             query: 搜索关键词
-            user_id: 用户 ID (提供时启用隔离)
+            user_id: 用户 ID
             limit: 返回数量
-            vector_weight: 向量权重
-            keyword_weight: 关键词权重
             include_shared: 是否包含共享记忆
-
-        Returns:
-            搜索结果列表
         """
-        if user_id:
-            # 用户隔离检索
-            if self.embedding_provider:
-                query_embedding = self.embedding_provider.embed(query)
-                return self.storage.search_hybrid_for_user(
-                    query=query,
-                    query_embedding=query_embedding,
-                    user_id=user_id,
-                    limit=limit,
-                    vector_weight=vector_weight,
-                    keyword_weight=keyword_weight,
-                    include_shared=include_shared
-                )
-            else:
-                return self.storage.search_for_user(
-                    query=query,
-                    user_id=user_id,
-                    limit=limit,
-                    include_shared=include_shared
-                )
-        else:
-            # 全局检索（无隔离）
-            if self.embedding_provider:
-                query_embedding = self.embedding_provider.embed(query)
-                return self.storage.search_hybrid(
-                    query=query,
-                    query_embedding=query_embedding,
-                    limit=limit,
-                    vector_weight=vector_weight,
-                    keyword_weight=keyword_weight
-                )
-            else:
-                return self.storage.search_keyword(query, limit)
+        if not self.embedding_provider:
+            return []
+
+        query_embedding = self.embedding_provider.embed(query)
+        scopes = ["user"]
+        if include_shared:
+            scopes.append("shared")
+
+        return self.storage.search_vector(
+            query_embedding=query_embedding,
+            user_id=user_id,
+            scopes=scopes,
+            limit=limit
+        )
+
+    # ==================== 文件操作 ====================
 
     def get_file_content(
         self,
@@ -307,11 +283,7 @@ class MemoryManager:
         start_line: int = 1,
         num_lines: int = None
     ) -> Optional[str]:
-        """
-        读取文件内容
-
-        CowAgent 的 memory_get 工具实现
-        """
+        """读取文件内容"""
         file_path = self.workspace_dir / path
         if not file_path.exists():
             return None
@@ -327,76 +299,95 @@ class MemoryManager:
 
         return '\n'.join(selected)
 
+    # ==================== 同步 ====================
+
     def sync_from_files(self):
         """
-        从文件系统同步到数据库
+        从文件系统同步到数据库（增量同步）
 
-        扫描：
-        1. MEMORY.md
-        2. profile/ 目录（用户画像）
-        3. memory/ 目录
+        根据 hash 判断文件是否变化
         """
-        # 扫描 MEMORY.md
-        memory_file = self.workspace_dir / "MEMORY.md"
-        if memory_file.exists():
-            self._sync_file(memory_file, "MEMORY.md", scope="shared")
+        # 同步共享 MEMORY.md
+        shared_memory = self.workspace_dir / "MEMORY.md"
+        if shared_memory.exists():
+            self._sync_file(shared_memory, "MEMORY.md", scope="shared", user_id=None)
 
-        # 扫描 profile 目录
-        for profile_file in self.profile_dir.glob("*.md"):
-            user_id = profile_file.stem
-            rel_path = f"profile/{profile_file.name}"
-            self._sync_file(profile_file, rel_path, scope="user", user_id=user_id)
+        # 同步共享每日记忆
+        shared_dir = self.memory_dir / "shared"
+        if shared_dir.exists():
+            for file_path in shared_dir.glob("*.md"):
+                rel_path = f"memory/shared/{file_path.name}"
+                self._sync_file(file_path, rel_path, scope="shared", user_id=None)
 
-        # 扫描 memory/ 目录
-        for file_path in self.memory_dir.rglob("*.md"):
-            rel_path = str(file_path.relative_to(self.workspace_dir))
-
-            # 判断 scope
-            if "shared" in rel_path:
-                scope = "shared"
-                user_id = None
-            else:
-                scope = "user"
-                # 从路径提取 user_id: memory/users/{user_id}/xxx.md
-                match = re.search(r"users/([^/]+)/", rel_path)
-                user_id = match.group(1) if match else None
-
-            self._sync_file(file_path, rel_path, scope=scope, user_id=user_id)
+        # 同步用户记忆
+        users_dir = self.memory_dir / "users"
+        if users_dir.exists():
+            for user_dir in users_dir.iterdir():
+                if user_dir.is_dir():
+                    user_id = user_dir.name
+                    # 用户 MEMORY.md
+                    user_memory = user_dir / "MEMORY.md"
+                    if user_memory.exists():
+                        rel_path = f"memory/users/{user_id}/MEMORY.md"
+                        self._sync_file(user_memory, rel_path, scope="user", user_id=user_id)
+                    # 用户每日记忆
+                    for file_path in user_dir.glob("*.md"):
+                        if file_path.name != "MEMORY.md":
+                            rel_path = f"memory/users/{user_id}/{file_path.name}"
+                            self._sync_file(file_path, rel_path, scope="user", user_id=user_id)
 
     def _sync_file(
         self,
         file_path: Path,
         rel_path: str,
-        scope: str = "shared",
-        user_id: str = None
+        scope: str,
+        user_id: str
     ):
-        """同步单个文件"""
+        """同步单个文件（增量）"""
         content = file_path.read_text(encoding='utf-8')
+        file_hash = MemoryStorage.compute_hash(content)
 
-        # 删除旧数据
+        # 检查是否变化
+        stored_hash = self.storage.get_file_hash(rel_path)
+        if stored_hash == file_hash:
+            return  # 未变化，跳过
+
+        # 变化，重新索引
         self.storage.delete_by_path(rel_path)
 
-        # 分块 + 向量化
-        chunks = self.chunker.chunk_text(content)
+        # 按行处理
+        lines = content.split('\n')
+        chunks = []
 
-        embeddings = None
-        if self.embedding_provider:
-            texts = [c.text for c in chunks]
-            embeddings = self.embedding_provider.embed_batch(texts)
+        for i, line in enumerate(lines, start=1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue  # 跳过空行和标题
 
-        # 保存
-        memory_chunks = []
-        for i, chunk in enumerate(chunks):
-            chunk_id = hashlib.md5(f"{rel_path}:{chunk.start_line}:{chunk.end_line}".encode()).hexdigest()
-            memory_chunks.append(MemoryChunk(
+            chunk_id = hashlib.md5(f"{rel_path}:{i}".encode()).hexdigest()
+            line_hash = MemoryStorage.compute_hash(line)
+
+            chunks.append(MemoryChunk(
                 id=chunk_id,
-                text=chunk.text,
-                embedding=embeddings[i] if embeddings else None,
+                text=line,
+                embedding=None,  # 稍后批量生成
                 path=rel_path,
-                start_line=chunk.start_line,
-                end_line=chunk.end_line,
+                start_line=i,
+                end_line=i,
                 scope=scope,
-                user_id=user_id
+                user_id=user_id,
+                hash=line_hash
             ))
 
-        self.storage.save_chunks_batch(memory_chunks)
+        # 批量生成向量
+        if chunks and self.embedding_provider:
+            texts = [c.text for c in chunks]
+            embeddings = self.embedding_provider.embed_batch(texts)
+            for chunk, embedding in zip(chunks, embeddings):
+                chunk.embedding = embedding
+
+        self.storage.save_chunks_batch(chunks)
+
+        # 更新文件 hash
+        stat = file_path.stat()
+        self.storage.update_file_hash(rel_path, file_hash, int(stat.st_mtime), stat.st_size)

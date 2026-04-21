@@ -26,6 +26,7 @@ class Config:
 
     # 记忆配置
     db_path: str = "memory.db"
+    context_db_path: str = "context.db"  # Session 历史数据库
     chunk_max_tokens: int = 500
     chunk_overlap_tokens: int = 50
     vector_weight: float = 0.7

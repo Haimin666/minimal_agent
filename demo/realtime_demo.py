@@ -20,6 +20,7 @@ from datetime import datetime
 from config import Config
 from agent import SimpleAgent
 from memory import MemoryStorage, MemoryChunk
+from profession_generator import USER_TEMPLATES, generate_user_memory
 import json
 import io
 import contextlib
@@ -37,15 +38,19 @@ class RealTimeDemo:
 
     def __init__(self):
         self.config = Config()
-        self.config.db_path = "./demo/realtime_workspace/demo.db"
-        self.config.workspace_dir = "./demo/realtime_workspace"
+        # 统一使用项目根目录下的 workspace
+        self.config.db_path = "./workspace/memory.db"
+        self.config.context_db_path = "./workspace/context.db"
+        self.config.workspace_dir = "./workspace"
 
         # 确保目录存在
-        os.makedirs("./demo/realtime_workspace", exist_ok=True)
+        os.makedirs("./workspace", exist_ok=True)
 
         self.agent = None
         self.user_id = None
         self.dialogue_count = 0
+        self.user_name = None
+        self.user_template = None
 
         # 自定义样式
         self.style = Style.from_dict({
@@ -58,7 +63,7 @@ class RealTimeDemo:
 
         # 命令补全
         self.command_completer = WordCompleter([
-            'history', 'prompt', 'messages', 'memory', 'clear', 'save', 'q', 'help'
+            'history', 'prompt', 'messages', 'memory', 'save', 'flush', 'clear', 'q', 'help'
         ])
 
         # 历史记录
@@ -84,62 +89,94 @@ class RealTimeDemo:
         # 选择或创建用户
         print("\n" + "-" * 50)
         print("请选择用户身份:")
-        print("  1. 王老师 (高中语文老师)")
-        print("  2. 李教授 (大学教授)")
-        print("  3. 张码农 (全栈开发工程师)")
-        print("  4. 刘总   (公司CEO)")
-        print("  5. 周医生 (三甲医院主任医师)")
-        print("  6. DJ阿杰 (酒吧DJ)")
-        print("  7. 孙教练 (健身教练)")
-        print("  8. 老王   (网约车司机)")
-        print("  9. 新用户 (自定义)")
+        for i, (user_id, t) in enumerate(USER_TEMPLATES.items(), 1):
+            print(f"  {i}. {t['name']:6} ({t['profession']})")
+        print(f"  {len(USER_TEMPLATES) + 1}. 新用户 (自定义)")
         print("-" * 50)
 
         try:
-            choice = input("\n请输入选项 (1-9): ").strip()
+            choice = input("\n请输入选项: ").strip()
         except EOFError:
             return
 
-        user_profiles = {
-            "1": ("teacher", "王老师", "高中语文老师", "热爱教育，喜欢听有声书，关心学生成长"),
-            "2": ("professor", "李教授", "大学教授", "学术研究，经常参加学术会议，关注科研动态"),
-            "3": ("developer", "张码农", "全栈开发工程师", "互联网大厂程序员，加班多，热爱技术"),
-            "4": ("boss", "刘总", "公司CEO", "企业老板，商务应酬多，时间宝贵"),
-            "5": ("doctor", "周医生", "三甲医院主任医师", "救死扶伤，工作繁忙，责任心强"),
-            "6": ("dj", "DJ阿杰", "酒吧DJ", "夜生活工作者，音乐狂热，个性张扬"),
-            "7": ("coach", "孙教练", "健身教练", "热爱运动，注重健康，精力充沛"),
-            "8": ("driver", "老王", "网约车司机", "全职司机，熟悉城市道路，服务态度好"),
-        }
+        # 用户选择映射
+        user_ids = list(USER_TEMPLATES.keys())
 
-        if choice in user_profiles:
-            self.user_id, name, profession, background = user_profiles[choice]
-            print(f"\n✅ 已选择用户: {name} ({profession})")
+        if choice.isdigit() and 1 <= int(choice) <= len(user_ids):
+            self.user_id = user_ids[int(choice) - 1]
+            self.user_template = USER_TEMPLATES[self.user_id]
+            self.user_name = self.user_template['name']
 
-            # 创建 Agent（静默模式）
+            print(f"\n✅ 已选择用户: {self.user_name} ({self.user_template['profession']})")
+
+            # 打印详细人设
+            self._print_user_profile()
+
+            # 创建 Agent
             self._create_agent_silent()
 
-            # 添加初始记忆
-            self._save_memory_silent(f"{name} 是一名{profession}，{background}")
+            # 生成记忆文件
+            self._generate_user_memory()
 
-        elif choice == "9":
+        elif choice == str(len(user_ids) + 1):
             try:
-                self.user_id = input("请输入用户ID: ").strip() or "new_user"
-                name = input("请输入姓名: ").strip() or "新用户"
-                profession = input("请输入职业: ").strip() or "未指定"
-                background = input("请输入背景简介: ").strip()
+                self.user_id = input("请输入用户ID或姓名: ").strip()
+                if not self.user_id:
+                    print("❌ 用户ID不能为空")
+                    return
+
+                # 使用输入作为用户ID和姓名
+                self.user_name = self.user_id
+                self.user_template = None  # 无人设，后续从对话中提炼
+
+                print(f"\n✅ 新用户: {self.user_name}")
+                print("   💡 无人设，后续将从对话中自动提炼记忆")
 
                 self._create_agent_silent()
-                self._save_memory_silent(f"{name} 是一名{profession}，{background}")
-                print(f"\n✅ 已创建用户: {name}")
+
             except EOFError:
                 return
         else:
             print("使用默认用户")
             self.user_id = "default_user"
+            self.user_name = "用户"
             self._create_agent_silent()
 
         # 进入交互
         self.interactive_loop()
+
+    def _print_user_profile(self):
+        """打印用户详细人设"""
+        t = self.user_template
+        print(f"\n{'─' * 50}")
+        print(f"📋 用户人设详情")
+        print(f"{'─' * 50}")
+        print(f"   👤 姓名: {t['name']}")
+        print(f"   💼 职业: {t['profession']}")
+        print(f"   🎭 性格: {t['personality']}")
+        print(f"   📝 简介: {t['profile']}")
+        if t['daily_events']:
+            print(f"\n   📅 近期事件:")
+            for event in t['daily_events'][:3]:
+                print(f"      • {event[:40]}{'...' if len(event) > 40 else ''}")
+        print(f"{'─' * 50}")
+
+    def _generate_user_memory(self):
+        """生成用户记忆文件"""
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = generate_user_memory(self.user_id, self.user_template, self.config.workspace_dir)
+            # 同步到数据库
+            self.agent.memory_manager.sync_from_files()
+
+        # 打印影响的文件和数据库
+        print(f"\n   📁 已生成/更新以下文件:")
+        print(f"      • workspace/memory/users/{self.user_id}/MEMORY.md")
+        print(f"      • workspace/memory/users/{self.user_id}/{today}.md")
+        print(f"\n   🗄️ 已同步到数据库:")
+        print(f"      • memory.db (向量索引)")
+        print(f"      • 共 {len(self.user_template['daily_events']) + 3} 条记忆块已索引")
 
     def _create_agent_silent(self):
         """静默创建 Agent"""
@@ -166,6 +203,7 @@ class RealTimeDemo:
   messages         - 查看完整消息列表
   memory <关键词>  - 搜索记忆
   save <内容>      - 主动保存记忆
+  flush            - 总结对话并写入每日记忆
   clear            - 清空对话历史
   help             - 显示帮助
   q                - 退出
@@ -198,6 +236,8 @@ class RealTimeDemo:
             arg = parts[1] if len(parts) > 1 else ""
 
             if cmd == "q":
+                # 退出前自动总结对话
+                self._auto_flush_on_exit()
                 print("\n👋 再见！")
                 break
 
@@ -226,31 +266,57 @@ class RealTimeDemo:
                 else:
                     print("❌ 用法: save <要保存的内容>")
 
+            elif cmd == "flush":
+                self._do_flush()
+
             else:
                 # 对话
                 self.chat(user_input)
 
     def _do_save_memory(self, content: str):
         """保存记忆并显示详情"""
-        import hashlib
-
-        # 生成路径
-        content_hash = hashlib.md5(content.encode()).hexdigest()[:8]
-        path = f"memory/users/{self.user_id}/memory_{content_hash}.md"
-
-        # 写入文件
-        file_path = self.agent.memory_manager.workspace_dir / path
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding='utf-8')
-
-        # 保存到数据库
+        # 保存到数据库（自动写入日期文件）
         with contextlib.redirect_stdout(io.StringIO()):
-            self.agent.add_memory(content, scope="user")
+            path = self.agent.add_memory(content, scope="user")
 
         print(f"\n[INFO] 记忆存入")
         print(f"  文件: {path}")
         print(f"  内容: {content[:100]}{'...' if len(content) > 100 else ''}")
         print(f"  范围: 用户私有 (user_id={self.user_id})")
+
+    def _do_flush(self):
+        """总结对话并写入每日记忆"""
+        messages = self.agent.context.get_openai_messages()
+        if not messages:
+            print("⚠️  当前无对话历史，无需总结")
+            return
+
+        print(f"\n[INFO] 正在总结 {len(messages)} 条对话...")
+        with contextlib.redirect_stdout(io.StringIO()):
+            success = self.agent.flush()
+
+        if success:
+            from datetime import datetime
+            today_file = f"memory/{self.user_id}/{datetime.now().strftime('%Y-%m-%d')}.md"
+            print(f"✅ 对话已总结并写入每日记忆")
+            print(f"   文件: {today_file}")
+        else:
+            print("ℹ️  对话内容无记录价值，未写入")
+
+    def _auto_flush_on_exit(self):
+        """退出时自动总结对话"""
+        messages = self.agent.context.get_openai_messages()
+        if not messages:
+            return
+
+        print(f"\n🔄 正在总结本次对话...")
+        with contextlib.redirect_stdout(io.StringIO()):
+            success = self.agent.flush()
+
+        if success:
+            from datetime import datetime
+            today_file = f"memory/{self.user_id}/{datetime.now().strftime('%Y-%m-%d')}.md"
+            print(f"✅ 已写入每日记忆: {today_file}")
 
     def chat(self, user_input: str):
         """对话并展示详情"""
@@ -265,16 +331,12 @@ class RealTimeDemo:
         print(f"  查询: \"{user_input}\"")
 
         with contextlib.redirect_stdout(io.StringIO()):
-            query_embedding = self.agent.embedding_provider.embed(user_input)
-
-        print(f"  向量化: {self.config.embedding_model}, 维度={len(query_embedding)}")
-
-        memories = self.agent.storage.search_hybrid_for_user(
-            query=user_input,
-            query_embedding=query_embedding,
-            user_id=self.user_id,
-            limit=3
-        )
+            memories = self.agent.memory_manager.search(
+                query=user_input,
+                user_id=self.user_id,
+                limit=3,
+                include_shared=True
+            )
 
         print(f"  结果: {len(memories)} 条")
         if memories:
@@ -347,14 +409,12 @@ class RealTimeDemo:
         print(f"\n[INFO] 记忆搜索: \"{query}\"")
 
         with contextlib.redirect_stdout(io.StringIO()):
-            query_embedding = self.agent.embedding_provider.embed(query)
-
-        memories = self.agent.storage.search_hybrid_for_user(
-            query=query,
-            query_embedding=query_embedding,
-            user_id=self.user_id,
-            limit=10
-        )
+            memories = self.agent.memory_manager.search(
+                query=query,
+                user_id=self.user_id,
+                limit=10,
+                include_shared=True
+            )
 
         print(f"  结果: {len(memories)} 条\n")
 
@@ -429,13 +489,12 @@ class RealTimeDemo:
 
         if last_user_msg:
             with contextlib.redirect_stdout(io.StringIO()):
-                query_embedding = self.agent.embedding_provider.embed(last_user_msg)
-            memories = self.agent.storage.search_hybrid_for_user(
-                query=last_user_msg,
-                query_embedding=query_embedding,
-                user_id=self.user_id,
-                limit=3
-            )
+                memories = self.agent.memory_manager.search(
+                    query=last_user_msg,
+                    user_id=self.user_id,
+                    limit=3,
+                    include_shared=True
+                )
             if memories:
                 memory_context = "## 相关记忆\n\n"
                 for m in memories:
@@ -478,6 +537,7 @@ class RealTimeDemo:
 ║  messages       查看完整消息列表（含记忆注入位置）                    ║
 ║  memory <关键词> 搜索记忆                                            ║
 ║  save <内容>    主动保存记忆                                         ║
+║  flush           总结对话并写入每日记忆                               ║
 ║  clear          清空对话历史                                         ║
 ║  help           显示此帮助                                           ║
 ║  q              退出                                                 ║

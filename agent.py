@@ -11,6 +11,7 @@ try:
     from .context import Context
     from .memory import MemoryManager, MemoryStorage
     from .memory.embedding import EmbeddingProvider
+    from .memory.flusher import MemoryFlusher
     from .prompt import PromptBuilder
     from .tools.memory_tools import MemorySearchTool, MemoryGetTool, ToolResult
     from .tools.file_tools import FileOperationsTool, FILE_TOOLS_DEFINITION
@@ -19,6 +20,7 @@ except ImportError:
     from context import Context
     from memory import MemoryManager, MemoryStorage
     from memory.embedding import EmbeddingProvider
+    from memory.flusher import MemoryFlusher
     from prompt import PromptBuilder
     from tools.memory_tools import MemorySearchTool, MemoryGetTool, ToolResult
     from tools.file_tools import FileOperationsTool, FILE_TOOLS_DEFINITION
@@ -185,6 +187,10 @@ class SimpleAgent:
 
         self.prompt_builder = PromptBuilder(self.config.workspace_dir)
 
+        # 设置 context_store 路径（必须在创建 Context 之前）
+        from .context_store import get_context_store
+        get_context_store(self.config.context_db_path)
+
         # 每个用户独立的上下文
         session_id = f"{user_id}_session" if user_id else "default"
         self.context = Context(session_id=session_id, user_id=user_id)
@@ -195,14 +201,26 @@ class SimpleAgent:
         # 文件操作工具（仅限工作空间目录）
         self.file_tool = FileOperationsTool(self.config.workspace_dir)
 
+        # 每日记忆 flush
+        self.flusher = MemoryFlusher(
+            workspace_dir=self.config.workspace_dir,
+            embedding_provider=self.embedding_provider,
+            memory_manager=self.memory_manager
+        )
+
         # 确保工作空间存在
         self._init_workspace()
+
+        # 同步文件记忆到数据库（增量同步）
+        self._sync_memory()
 
     def _init_workspace(self):
         """初始化工作空间"""
         workspace = Path(self.config.workspace_dir)
         workspace.mkdir(parents=True, exist_ok=True)
         (workspace / "memory").mkdir(exist_ok=True)
+        (workspace / "memory" / "shared").mkdir(exist_ok=True)
+        (workspace / "memory" / "users").mkdir(exist_ok=True)
 
         # 创建默认文件
         agent_file = workspace / "AGENT.md"
@@ -212,6 +230,14 @@ class SimpleAgent:
         memory_file = workspace / "MEMORY.md"
         if not memory_file.exists():
             memory_file.write_text("# MEMORY.md\n\n长期记忆索引。\n", encoding='utf-8')
+
+    def _sync_memory(self):
+        """同步文件记忆到数据库"""
+        try:
+            self.memory_manager.sync_from_files()
+        except Exception as e:
+            # 同步失败不影响启动
+            print(f"[WARN] 记忆同步失败: {e}")
 
     def chat(self, user_input: str) -> Dict[str, Any]:
         """
@@ -236,8 +262,7 @@ class SimpleAgent:
             query=user_input,
             user_id=self.user_id,
             limit=5,
-            vector_weight=self.config.vector_weight,
-            keyword_weight=self.config.keyword_weight
+            include_shared=True
         )
 
         # 3. 构建消息列表
@@ -499,11 +524,10 @@ class SimpleAgent:
         else:
             return {"success": False, "error": f"未知工具: {tool_name}"}
 
-    def add_memory(self, content: str, path: str = None, scope: str = "user"):
+    def add_memory(self, content: str, scope: str = "user"):
         """添加记忆"""
         return self.memory_manager.add_memory(
             content=content,
-            path=path,
             user_id=self.user_id,
             scope=scope
         )
@@ -511,3 +535,19 @@ class SimpleAgent:
     def clear_history(self):
         """清空对话历史"""
         self.context.clear()
+
+    def flush(self) -> bool:
+        """
+        总结对话并写入每日记忆
+
+        Returns:
+            是否成功写入
+        """
+        messages = self.context.get_openai_messages()
+        return self.flusher.flush_messages(
+            messages=messages,
+            user_id=self.user_id,
+            api_base=self.config.api_base,
+            api_key=self.config.api_key,
+            model=self.config.model
+        )
