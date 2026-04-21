@@ -9,6 +9,7 @@ import re
 try:
     from .config import Config
     from .context import Context
+    from .context_store import get_context_store
     from .memory import MemoryManager, MemoryStorage
     from .memory.embedding import EmbeddingProvider
     from .memory.flusher import MemoryFlusher
@@ -18,6 +19,7 @@ try:
 except ImportError:
     from config import Config
     from context import Context
+    from context_store import get_context_store
     from memory import MemoryManager, MemoryStorage
     from memory.embedding import EmbeddingProvider
     from memory.flusher import MemoryFlusher
@@ -188,7 +190,6 @@ class SimpleAgent:
         self.prompt_builder = PromptBuilder(self.config.workspace_dir)
 
         # 设置 context_store 路径（必须在创建 Context 之前）
-        from .context_store import get_context_store
         get_context_store(self.config.context_db_path)
 
         # 每个用户独立的上下文
