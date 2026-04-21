@@ -13,6 +13,7 @@ try:
     from .memory.embedding import EmbeddingProvider
     from .prompt import PromptBuilder
     from .tools.memory_tools import MemorySearchTool, MemoryGetTool, ToolResult
+    from .tools.file_tools import FileOperationsTool, FILE_TOOLS_DEFINITION
 except ImportError:
     from config import Config
     from context import Context
@@ -20,6 +21,7 @@ except ImportError:
     from memory.embedding import EmbeddingProvider
     from prompt import PromptBuilder
     from tools.memory_tools import MemorySearchTool, MemoryGetTool, ToolResult
+    from tools.file_tools import FileOperationsTool, FILE_TOOLS_DEFINITION
 
 
 # 工具定义（OpenAI 格式）
@@ -59,6 +61,87 @@ TOOLS_DEFINITION = [
                     }
                 },
                 "required": ["query"]
+            }
+        }
+    },
+    # 文件操作工具
+    {
+        "type": "function",
+        "function": {
+            "name": "file_read",
+            "description": "读取工作空间内的文件内容，仅限项目目录内",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "文件路径（相对于工作空间根目录）"
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "file_write",
+            "description": "写入文件（创建或覆盖），仅限工作空间目录内",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "文件路径（相对于工作空间根目录）"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "要写入的内容"
+                    }
+                },
+                "required": ["path", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "file_edit",
+            "description": "编辑文件（替换文本），仅限工作空间目录内",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "文件路径（相对于工作空间根目录）"
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "要替换的文本"
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "替换后的文本"
+                    }
+                },
+                "required": ["path", "old_text", "new_text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "file_list",
+            "description": "列出工作空间目录内容",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "目录路径（默认为根目录）",
+                        "default": "."
+                    }
+                }
             }
         }
     }
@@ -108,6 +191,9 @@ class SimpleAgent:
 
         # 工具调用记录
         self.tool_calls_log = []
+
+        # 文件操作工具（仅限工作空间目录）
+        self.file_tool = FileOperationsTool(self.config.workspace_dir)
 
         # 确保工作空间存在
         self._init_workspace()
@@ -188,7 +274,7 @@ class SimpleAgent:
         """构建系统提示词"""
         from datetime import datetime
 
-        base_prompt = """你是一个智能助手，具有长期记忆能力。
+        base_prompt = """你是一个智能助手，具有长期记忆能力和文件操作能力。
 
 ## 记忆能力
 
@@ -216,6 +302,16 @@ class SimpleAgent:
 - 临时性的对话内容
 - 问候语和闲聊
 - 可以随时查到的常识
+
+## 文件操作能力
+
+你可以通过工具操作工作空间内的文件：
+- `file_read`: 读取文件内容
+- `file_write`: 写入文件（创建或覆盖）
+- `file_edit`: 编辑文件（替换文本）
+- `file_list`: 列出目录内容
+
+安全限制：只能在工作空间目录内操作，不能访问目录外的文件。
 """
 
         # 添加上下文文件内容
@@ -335,6 +431,69 @@ class SimpleAgent:
                     }
                     for r in results
                 ]
+            }
+
+        # 文件操作工具
+        elif tool_name == "file_read":
+            path = tool_args.get("path", "")
+            result = self.file_tool.read(path)
+
+            self.tool_calls_log.append({
+                "tool": "file_read",
+                "path": path,
+                "success": result.success
+            })
+
+            return {
+                "success": result.success,
+                "content": result.content
+            }
+
+        elif tool_name == "file_write":
+            path = tool_args.get("path", "")
+            content = tool_args.get("content", "")
+            result = self.file_tool.write(path, content)
+
+            self.tool_calls_log.append({
+                "tool": "file_write",
+                "path": path,
+                "success": result.success
+            })
+
+            return {
+                "success": result.success,
+                "message": result.content
+            }
+
+        elif tool_name == "file_edit":
+            path = tool_args.get("path", "")
+            old_text = tool_args.get("old_text", "")
+            new_text = tool_args.get("new_text", "")
+            result = self.file_tool.edit(path, old_text, new_text)
+
+            self.tool_calls_log.append({
+                "tool": "file_edit",
+                "path": path,
+                "success": result.success
+            })
+
+            return {
+                "success": result.success,
+                "message": result.content
+            }
+
+        elif tool_name == "file_list":
+            path = tool_args.get("path", ".")
+            result = self.file_tool.list_dir(path)
+
+            self.tool_calls_log.append({
+                "tool": "file_list",
+                "path": path
+            })
+
+            return {
+                "success": result.success,
+                "content": result.content
             }
 
         else:
