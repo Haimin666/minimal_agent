@@ -17,6 +17,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datetime import datetime
+from pathlib import Path
 from config import Config
 from agent import SimpleAgent
 from memory import MemoryStorage, MemoryChunk
@@ -37,14 +38,18 @@ class RealTimeDemo:
     """真实场景演示"""
 
     def __init__(self):
+        # 获取项目根目录（demo 的父目录）
+        project_root = Path(__file__).parent.parent
+
         self.config = Config()
-        # 统一使用项目根目录下的 workspace
-        self.config.db_path = "./workspace/memory.db"
-        self.config.context_db_path = "./workspace/context.db"
-        self.config.workspace_dir = "./workspace"
+        # 使用绝对路径，避免工作目录问题
+        workspace_dir = project_root / "workspace"
+        self.config.db_path = "memory.db"
+        self.config.context_db_path = "context.db"
+        self.config.workspace_dir = str(workspace_dir)
 
         # 确保目录存在
-        os.makedirs("./workspace", exist_ok=True)
+        workspace_dir.mkdir(parents=True, exist_ok=True)
 
         self.agent = None
         self.user_id = None
@@ -179,9 +184,15 @@ class RealTimeDemo:
         print(f"      • 共 {len(self.user_template['daily_events']) + 3} 条记忆块已索引")
 
     def _create_agent_silent(self):
-        """静默创建 Agent"""
+        """创建 Agent 并检查历史会话"""
         with contextlib.redirect_stdout(io.StringIO()):
             self.agent = SimpleAgent(self.config, user_id=self.user_id)
+
+        # 检查是否恢复了历史会话
+        history = self.agent.context.get_openai_messages()
+        if history:
+            print(f"\n   📜 已恢复历史会话: {len(history)} 条消息")
+            print(f"   💡 输入 'history' 查看详情")
 
     def _save_memory_silent(self, content: str):
         """静默保存记忆"""
@@ -304,19 +315,31 @@ class RealTimeDemo:
             print("ℹ️  对话内容无记录价值，未写入")
 
     def _auto_flush_on_exit(self):
-        """退出时自动总结对话"""
+        """退出时自动总结对话并蒸馏记忆"""
+        # 调用 agent.exit() 完成完整的退出流程：
+        # 1. Flush 剩余对话到每日记忆
+        # 2. Deep Dream 蒸馏近期记忆 → 更新长期记忆
+        # 3. 保存上下文
+        print(f"\n🔄 正在处理退出流程...")
+
+        # 检查是否有对话历史
         messages = self.agent.context.get_openai_messages()
-        if not messages:
-            return
+        if messages:
+            print(f"   1. 总结本次对话...")
+            print(f"   2. 蒸馏近期记忆...")
+        else:
+            print(f"   1. 无对话需要总结")
+            print(f"   2. 蒸馏近期记忆...")
 
-        print(f"\n🔄 正在总结本次对话...")
-        with contextlib.redirect_stdout(io.StringIO()):
-            success = self.agent.flush()
+        # 调用完整的 exit 流程
+        self.agent.exit()
 
-        if success:
-            from datetime import datetime
-            today_file = f"memory/{self.user_id}/{datetime.now().strftime('%Y-%m-%d')}.md"
-            print(f"✅ 已写入每日记忆: {today_file}")
+        # 获取今日文件路径
+        from datetime import datetime
+        today_file = f"memory/{self.user_id}/{datetime.now().strftime('%Y-%m-%d')}.md"
+        print(f"✅ 退出处理完成")
+        print(f"   每日记忆: {today_file}")
+        print(f"   长期记忆: memory/{self.user_id}/MEMORY.md")
 
     def chat(self, user_input: str):
         """对话并展示详情"""
@@ -540,13 +563,17 @@ class RealTimeDemo:
 ║  flush           总结对话并写入每日记忆                               ║
 ║  clear          清空对话历史                                         ║
 ║  help           显示此帮助                                           ║
-║  q              退出                                                 ║
+║  q              退出（自动 flush + distill 更新长期记忆）             ║
 ╠═══════════════════════════════════════════════════════════════════╣
 ║  快捷键:                                                            ║
 ║  ↑/↓            查看历史输入                                         ║
 ║  Tab            自动补全命令                                         ║
 ║  Ctrl+C         中断当前操作                                         ║
 ║  Ctrl+D         退出                                                 ║
+╠═══════════════════════════════════════════════════════════════════╣
+║  退出流程:                                                          ║
+║  1. Flush: 对话 → 每日记忆 (YYYY-MM-DD.md)                           ║
+║  2. Distill: 每日记忆 → 长期记忆 (MEMORY.md)                         ║
 ╚═══════════════════════════════════════════════════════════════════╝
         """)
 

@@ -5,9 +5,10 @@
     - LLM 总结对话内容
     - 写入每日记忆文件
     - 支持手动触发和自动触发
+    - 上下文摘要注入（可选）
 """
 
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Callable
 from pathlib import Path
 from datetime import datetime
 import hashlib
@@ -82,7 +83,8 @@ class MemoryFlusher:
         llm_client: Any = None,
         api_base: str = None,
         api_key: str = None,
-        model: str = None
+        model: str = None,
+        context_summary_callback: Optional[Callable[[str], None]] = None,
     ) -> bool:
         """
         总结对话并写入每日记忆
@@ -94,6 +96,7 @@ class MemoryFlusher:
             api_base: API 地址
             api_key: API Key
             model: 模型名称
+            context_summary_callback: 上下文摘要回调，用于注入摘要到当前对话
 
         Returns:
             是否成功写入
@@ -123,6 +126,13 @@ class MemoryFlusher:
 
         # 写入文件
         self._write_daily(summary, user_id)
+
+        # 上下文摘要注入回调
+        if context_summary_callback:
+            try:
+                context_summary_callback(summary)
+            except Exception:
+                pass
 
         return True
 

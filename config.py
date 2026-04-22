@@ -29,12 +29,17 @@ class Config:
     context_db_path: str = "context.db"  # Session 历史数据库
     chunk_max_tokens: int = 500
     chunk_overlap_tokens: int = 50
-    vector_weight: float = 0.7
-    keyword_weight: float = 0.3
     max_results: int = 10
 
     # 工作空间（相对路径）
     workspace_dir: str = "./workspace"
 
-    # 时间衰减 (天)
-    half_life_days: float = 30.0
+    # ==================== 三层记忆架构配置 ====================
+
+    # 上下文限制
+    max_context_turns: int = 20        # 最大对话轮次
+    max_context_tokens: int = 50000    # 最大 token 数
+
+    # 记忆蒸馏
+    memory_max_items: int = 50         # MEMORY.md 最大条目数
+    deep_dream_lookback: int = 3       # 蒸馏回看天数

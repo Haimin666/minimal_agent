@@ -1,4 +1,10 @@
-"""记忆管理器 - 文件 + 向量数据库混合存储"""
+"""记忆管理器 - 简化版：只追加，不更新
+
+设计原则：
+- 只追加写入，不实时编辑
+- 仅向量检索（移除关键词兜底）
+- 冲突/更新由 Deep Dream 延迟处理
+"""
 
 from typing import List, Optional, Dict, Any
 from pathlib import Path
@@ -14,7 +20,7 @@ from .embedding import EmbeddingProvider
 
 class MemoryManager:
     """
-    记忆管理器 - 文件（人类可读）+ 数据库（机器检索）
+    记忆管理器 - 简化版
 
     存储结构：
     workspace/
@@ -28,13 +34,9 @@ class MemoryManager:
                 └── YYYY-MM-DD.md  # 用户每日记忆
 
     更新机制：
-    - 新记忆 → 检测相似度
-    - 相似度 > 0.85 → 编辑文件对应行 + 更新向量
-    - 相似度 <= 0.85 → 追加到当日文件末尾 + 新增向量
+    - 新记忆 → 直接追加到当日文件末尾
+    - 冲突检测 → 由 Deep Dream 延迟处理
     """
-
-    # 相似度阈值
-    SIMILARITY_THRESHOLD = 0.85
 
     def __init__(
         self,
@@ -42,7 +44,7 @@ class MemoryManager:
         embedding_provider: EmbeddingProvider = None,
         workspace_dir: str = "./workspace",
         chunk_max_tokens: int = 500,
-        chunk_overlap_tokens: int = 50
+        chunk_overlap_tokens: int = 50,
     ):
         self.storage = storage or MemoryStorage()
         self.embedding_provider = embedding_provider
@@ -66,15 +68,17 @@ class MemoryManager:
         content: str,
         user_id: str = None,
         scope: str = "user",
+        tags: List[str] = None,
         **metadata
     ) -> str:
         """
-        添加记忆 - 支持更新模式
+        添加记忆 - 只追加，不检测相似度
 
         Args:
             content: 记忆内容（单行）
             user_id: 用户 ID
             scope: 记忆范围 (shared | user)
+            tags: 语义标签列表，例如 ['职业:教师', '科目:语文']
 
         Returns:
             文件路径
@@ -84,29 +88,26 @@ class MemoryManager:
 
         # 格式化为一行
         line_content = content.strip().replace('\n', ' ')
+
+        # 附加标签到内容末尾（提高检索效果）
+        # 标签格式: [职业:教师] [科目:语文]
+        if tags:
+            tag_str = ' '.join(f'[{tag}]' for tag in tags)
+            line_content = f"{line_content} {tag_str}"
+
         if not line_content.startswith('- '):
             line_content = f"- {line_content}"
 
         # 获取当日文件路径
         path = self._get_today_path(user_id, scope)
 
-        # 检查是否需要更新（相似记忆存在）
-        similar = None
-        if self.embedding_provider:
-            similar = self._find_similar_memory(line_content, user_id, scope)
+        # 追加到文件末尾
+        line_num = self._append_to_file(path, line_content)
 
-        if similar:
-            # 更新模式：编辑文件对应行
-            self._edit_memory_line(similar.path, similar.start_line, line_content)
-            # 更新数据库
-            self._update_chunk(similar, line_content)
-            return similar.path
-        else:
-            # 新增模式：追加到文件末尾
-            line_num = self._append_to_file(path, line_content)
-            # 同步到数据库
-            self._sync_single_line(path, line_num, line_content, user_id, scope)
-            return path
+        # 同步到数据库
+        self._sync_single_line(path, line_num, line_content, user_id, scope)
+
+        return path
 
     def _get_today_path(self, user_id: str, scope: str) -> str:
         """获取当日文件路径"""
@@ -116,32 +117,6 @@ class MemoryManager:
             return f"memory/shared/{today}.md"
         else:
             return f"memory/users/{user_id}/{today}.md"
-
-    def _find_similar_memory(
-        self,
-        content: str,
-        user_id: str,
-        scope: str
-    ) -> Optional[SearchResult]:
-        """查找相似记忆"""
-        if not self.embedding_provider:
-            return None
-
-        query_embedding = self.embedding_provider.embed(content)
-        scopes = ["user"] if scope == "user" else ["shared"]
-
-        results = self.storage.search_vector(
-            query_embedding=query_embedding,
-            user_id=user_id if scope == "user" else None,
-            scopes=scopes,
-            limit=5
-        )
-
-        for r in results:
-            if r.score >= self.SIMILARITY_THRESHOLD:
-                return r
-
-        return None
 
     def _append_to_file(self, path: str, line_content: str) -> int:
         """追加一行到文件，返回行号"""
@@ -168,17 +143,6 @@ class MemoryManager:
             header = f"# Daily Memory: {today}\n\n"
             file_path.write_text(header + line_content + '\n', encoding='utf-8')
             return 3  # 第3行开始（标题 + 空行）
-
-    def _edit_memory_line(self, path: str, line_num: int, new_content: str):
-        """编辑文件指定行"""
-        file_path = self.workspace_dir / path
-        if not file_path.exists():
-            return
-
-        lines = file_path.read_text(encoding='utf-8').split('\n')
-        if 0 < line_num <= len(lines):
-            lines[line_num - 1] = new_content
-            file_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
     def _sync_single_line(
         self,
@@ -218,30 +182,6 @@ class MemoryManager:
             stat = file_path.stat()
             self.storage.update_file_hash(path, file_hash, int(stat.st_mtime), stat.st_size)
 
-    def _update_chunk(self, similar: SearchResult, new_content: str):
-        """更新数据库中的块"""
-        content_hash = MemoryStorage.compute_hash(new_content)
-
-        # 获取 chunk
-        chunk = self.storage.get_chunk_by_path_line(similar.path, similar.start_line)
-        if not chunk:
-            return
-
-        # 更新文本
-        self.storage.update_chunk_text(chunk.id, new_content, content_hash)
-
-        # 更新向量
-        if self.embedding_provider:
-            embedding = self.embedding_provider.embed(new_content)
-            self.storage.update_chunk_embedding(chunk.id, embedding)
-
-        # 更新文件 hash
-        file_path = self.workspace_dir / similar.path
-        if file_path.exists():
-            file_hash = MemoryStorage.compute_hash(file_path.read_text(encoding='utf-8'))
-            stat = file_path.stat()
-            self.storage.update_file_hash(similar.path, file_hash, int(stat.st_mtime), stat.st_size)
-
     # ==================== 搜索记忆 ====================
 
     def search(
@@ -249,31 +189,117 @@ class MemoryManager:
         query: str,
         user_id: str = None,
         limit: int = 10,
-        include_shared: bool = True
+        include_shared: bool = True,
+        vector_weight: float = 0.7,
+        keyword_weight: float = 0.3,
     ) -> List[SearchResult]:
         """
-        搜索记忆
+        搜索记忆 - 混合检索（向量 + 关键词），与 CowAgent 一致
 
         Args:
             query: 搜索关键词
             user_id: 用户 ID
             limit: 返回数量
             include_shared: 是否包含共享记忆
+            vector_weight: 向量检索权重
+            keyword_weight: 关键词检索权重
         """
-        if not self.embedding_provider:
-            return []
-
-        query_embedding = self.embedding_provider.embed(query)
         scopes = ["user"]
         if include_shared:
             scopes.append("shared")
 
-        return self.storage.search_vector(
-            query_embedding=query_embedding,
+        # 1. 向量检索
+        vector_results = []
+        if self.embedding_provider:
+            try:
+                query_embedding = self.embedding_provider.embed(query)
+                vector_results = self.storage.search_vector(
+                    query_embedding=query_embedding,
+                    user_id=user_id,
+                    scopes=scopes,
+                    limit=limit * 2  # 获取更多候选
+                )
+            except Exception:
+                pass
+
+        # 2. 关键词检索
+        keyword_results = self.storage.search_keyword(
+            query=query,
             user_id=user_id,
             scopes=scopes,
-            limit=limit
+            limit=limit * 2
         )
+
+        # 3. 合并结果
+        merged = self._merge_results(
+            vector_results,
+            keyword_results,
+            vector_weight,
+            keyword_weight
+        )
+
+        return merged[:limit]
+
+    def _merge_results(
+        self,
+        vector_results: List[SearchResult],
+        keyword_results: List[SearchResult],
+        vector_weight: float,
+        keyword_weight: float
+    ) -> List[SearchResult]:
+        """
+        合并向量和关键词检索结果
+
+        Args:
+            vector_results: 向量检索结果
+            keyword_results: 关键词检索结果
+            vector_weight: 向量权重
+            keyword_weight: 关键词权重
+        """
+        # 使用 (path, start_line, end_line) 作为唯一键
+        merged_map = {}
+
+        for result in vector_results:
+            key = (result.path, result.start_line, result.end_line)
+            merged_map[key] = {
+                'result': result,
+                'vector_score': result.score,
+                'keyword_score': 0.0
+            }
+
+        for result in keyword_results:
+            key = (result.path, result.start_line, result.end_line)
+            if key in merged_map:
+                merged_map[key]['keyword_score'] = result.score
+            else:
+                merged_map[key] = {
+                    'result': result,
+                    'vector_score': 0.0,
+                    'keyword_score': result.score
+                }
+
+        # 计算加权分数
+        merged_results = []
+        for entry in merged_map.values():
+            result = entry['result']
+            combined_score = (
+                vector_weight * entry['vector_score'] +
+                keyword_weight * entry['keyword_score']
+            )
+
+            merged_results.append(SearchResult(
+                path=result.path,
+                start_line=result.start_line,
+                end_line=result.end_line,
+                score=combined_score,
+                snippet=result.snippet,
+                scope=result.scope,
+                user_id=result.user_id
+            ))
+
+        # 按分数排序
+        merged_results.sort(key=lambda r: r.score, reverse=True)
+        return merged_results
 
     # ==================== 文件操作 ====================
 

@@ -3,7 +3,6 @@
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
 from pathlib import Path
-import os
 
 
 @dataclass
@@ -180,88 +179,3 @@ class FileOperationsTool:
             return self.delete(args.get("path", ""))
         else:
             return ToolResult.fail(f"未知操作: {operation}")
-
-
-# OpenAI 工具定义格式
-FILE_TOOLS_DEFINITION = [
-    {
-        "type": "function",
-        "function": {
-            "name": "file_read",
-            "description": "读取工作空间内的文件内容",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "文件路径（相对于工作空间根目录）"
-                    }
-                },
-                "required": ["path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "file_write",
-            "description": "写入文件（创建或覆盖），仅限工作空间目录内",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "文件路径（相对于工作空间根目录）"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "要写入的内容"
-                    }
-                },
-                "required": ["path", "content"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "file_edit",
-            "description": "编辑文件（替换文本），仅限工作空间目录内",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "文件路径（相对于工作空间根目录）"
-                    },
-                    "old_text": {
-                        "type": "string",
-                        "description": "要替换的文本"
-                    },
-                    "new_text": {
-                        "type": "string",
-                        "description": "替换后的文本"
-                    }
-                },
-                "required": ["path", "old_text", "new_text"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "file_list",
-            "description": "列出工作空间目录内容",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "目录路径（默认为根目录）",
-                        "default": "."
-                    }
-                }
-            }
-        }
-    }
-]

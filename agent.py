@@ -1,4 +1,4 @@
-"""Agent 主类 - 接入真实 LLM + 自动记忆"""
+"""Agent 主类 - 三层记忆架构"""
 
 from typing import List, Optional, Dict, Any
 import json
@@ -8,24 +8,20 @@ import re
 
 try:
     from .config import Config
-    from .context import Context
+    from .context import Context, Message
     from .context_store import get_context_store
-    from .memory import MemoryManager, MemoryStorage
+    from .memory import MemoryManager, MemoryStorage, MemoryFlusher, DeepDream
     from .memory.embedding import EmbeddingProvider
-    from .memory.flusher import MemoryFlusher
     from .prompt import PromptBuilder
-    from .tools.memory_tools import MemorySearchTool, MemoryGetTool, ToolResult
-    from .tools.file_tools import FileOperationsTool, FILE_TOOLS_DEFINITION
+    from .tools.file_tools import FileOperationsTool
 except ImportError:
     from config import Config
-    from context import Context
+    from context import Context, Message
     from context_store import get_context_store
-    from memory import MemoryManager, MemoryStorage
+    from memory import MemoryManager, MemoryStorage, MemoryFlusher, DeepDream
     from memory.embedding import EmbeddingProvider
-    from memory.flusher import MemoryFlusher
     from prompt import PromptBuilder
-    from tools.memory_tools import MemorySearchTool, MemoryGetTool, ToolResult
-    from tools.file_tools import FileOperationsTool, FILE_TOOLS_DEFINITION
+    from tools.file_tools import FileOperationsTool
 
 
 # 工具定义（OpenAI 格式）
@@ -41,6 +37,11 @@ TOOLS_DEFINITION = [
                     "content": {
                         "type": "string",
                         "description": "要保存的记忆内容，应该简洁明确，例如：'用户是王教授，在清华大学任教'"
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "语义标签，用于提高检索效果。例如：用户说'我是语文老师'，标签应为 ['职业:教师', '科目:语文']。常用标签类型：职业、科目、爱好、地点、姓名"
                     },
                     "reason": {
                         "type": "string",
@@ -154,15 +155,20 @@ TOOLS_DEFINITION = [
 
 class SimpleAgent:
     """
-    Agent 实现 - 支持自动记忆
+    Agent 实现 - 三层记忆架构
+
+    记忆层级:
+    - 短期记忆: Context.messages (内存 + SQLite 持久化)
+    - 中期记忆: YYYY-MM-DD.md (上下文裁剪时 Flush)
+    - 长期记忆: MEMORY.md (退出时 Deep Dream 蒸馏)
 
     核心流程:
     1. 构建系统提示词 (PromptBuilder)
-    2. 搜索相关记忆 (MemoryManager.search)
+    2. 搜索相关记忆 (MemoryManager.search - 仅向量检索)
     3. 构建消息列表 (Context)
     4. 调用 LLM API（支持工具调用）
     5. 执行工具调用（如 memory_save）
-    6. 保存对话历史
+    6. 保存对话历史（可能触发裁剪 → Flush）
     """
 
     def __init__(self, config: Config = None, user_id: str = None):
@@ -177,24 +183,34 @@ class SimpleAgent:
             dimensions=self.config.embedding_dimensions
         )
 
-        self.storage = MemoryStorage(self.config.db_path)
+        # 确保工作空间存在
+        self._init_workspace()
+
+        # 存储层（在 workspace 目录下）
+        memory_db_path = Path(self.config.workspace_dir) / self.config.db_path
+        self.storage = MemoryStorage(str(memory_db_path))
 
         self.memory_manager = MemoryManager(
             storage=self.storage,
             embedding_provider=self.embedding_provider,
             workspace_dir=self.config.workspace_dir,
             chunk_max_tokens=self.config.chunk_max_tokens,
-            chunk_overlap_tokens=self.config.chunk_overlap_tokens
+            chunk_overlap_tokens=self.config.chunk_overlap_tokens,
         )
 
         self.prompt_builder = PromptBuilder(self.config.workspace_dir)
 
         # 设置 context_store 路径（必须在创建 Context 之前）
-        get_context_store(self.config.context_db_path)
+        context_db_path = Path(self.config.workspace_dir) / self.config.context_db_path
 
         # 每个用户独立的上下文
         session_id = f"{user_id}_session" if user_id else "default"
-        self.context = Context(session_id=session_id, user_id=user_id)
+        self.context = Context(
+            session_id=session_id,
+            user_id=user_id,
+            max_turns=self.config.max_context_turns,
+            db_path=str(context_db_path)
+        )
 
         # 工具调用记录
         self.tool_calls_log = []
@@ -209,8 +225,12 @@ class SimpleAgent:
             memory_manager=self.memory_manager
         )
 
-        # 确保工作空间存在
-        self._init_workspace()
+        # Deep Dream 蒸馏
+        self.deep_dream = DeepDream(
+            workspace_dir=self.config.workspace_dir,
+            embedding_provider=self.embedding_provider,
+            memory_manager=self.memory_manager
+        )
 
         # 同步文件记忆到数据库（增量同步）
         self._sync_memory()
@@ -248,17 +268,19 @@ class SimpleAgent:
             {
                 "response": str,           # 助手回复
                 "tool_calls": list,        # 工具调用记录
-                "memories_found": int      # 检索到的记忆数
+                "memories_found": int,     # 检索到的记忆数
+                "flushed": bool            # 是否触发了 flush
             }
         """
         self.tool_calls_log = []
+        flushed = False
 
         # 1. 构建系统提示词
         context_files = self.prompt_builder.load_context_files()
 
         system_prompt = self._build_system_prompt(context_files)
 
-        # 2. 搜索相关记忆
+        # 2. 搜索相关记忆（混合检索：向量 + 关键词）
         memories = self.memory_manager.search(
             query=user_input,
             user_id=self.user_id,
@@ -277,8 +299,8 @@ class SimpleAgent:
                 memory_context += f"- [{scope_tag}] {m.snippet[:200]}\n"
             messages.append({"role": "system", "content": memory_context})
 
-        # 添加历史消息
-        messages.extend(self.context.get_openai_messages())
+        # 添加历史消息（带上下文摘要）
+        messages.extend(self.context.get_messages_with_summary())
 
         # 添加当前输入
         messages.append({"role": "user", "content": user_input})
@@ -286,14 +308,20 @@ class SimpleAgent:
         # 4. 调用 LLM（支持工具调用）
         response = self._call_llm_with_tools(messages)
 
-        # 5. 保存历史
-        self.context.add_message("user", user_input)
+        # 5. 保存历史（可能触发裁剪）
+        discarded = self.context.add_message("user", user_input)
         self.context.add_message("assistant", response["content"])
+
+        # 6. 如果触发了裁剪，flush 被裁剪的消息并注入摘要
+        if discarded:
+            self._flush_discarded(discarded)
+            flushed = True
 
         return {
             "response": response["content"],
             "tool_calls": self.tool_calls_log,
-            "memories_found": len(memories)
+            "memories_found": len(memories),
+            "flushed": flushed
         }
 
     def _build_system_prompt(self, context_files: list) -> str:
@@ -405,7 +433,8 @@ class SimpleAgent:
                 continue
 
             # 没有工具调用，返回最终回复
-            return {"content": message.get("content", "")}
+            content = message.get("content") or ""
+            return {"content": content}
 
         # 超过最大迭代次数
         return {"content": "抱歉，处理过程中出现问题。"}
@@ -415,20 +444,22 @@ class SimpleAgent:
         if tool_name == "memory_save":
             content = tool_args.get("content", "")
             reason = tool_args.get("reason", "")
+            tags = tool_args.get("tags", [])
 
-            # 保存记忆
-            path = self.add_memory(content, scope="user")
+            # 保存记忆（带标签）
+            path = self.add_memory(content, scope="user", tags=tags)
 
             self.tool_calls_log.append({
                 "tool": "memory_save",
                 "content": content,
+                "tags": tags,
                 "reason": reason,
                 "path": path
             })
 
             return {
                 "success": True,
-                "message": f"已保存记忆: {content[:50]}...",
+                "message": f"已保存记忆: {content[:50]}..." + (f" [标签: {', '.join(tags)}]" if tags else ""),
                 "path": path
             }
 
@@ -525,21 +556,46 @@ class SimpleAgent:
         else:
             return {"success": False, "error": f"未知工具: {tool_name}"}
 
-    def add_memory(self, content: str, scope: str = "user"):
-        """添加记忆"""
+    def add_memory(self, content: str, scope: str = "user", tags: List[str] = None):
+        """添加记忆（带标签）"""
         return self.memory_manager.add_memory(
             content=content,
             user_id=self.user_id,
-            scope=scope
+            scope=scope,
+            tags=tags or []
         )
 
     def clear_history(self):
         """清空对话历史"""
         self.context.clear()
 
+    def _flush_discarded(self, messages: List[Message]):
+        """
+        Flush 被裁剪的消息到每日记忆，并注入上下文摘要
+
+        流程：
+        1. 调用 LLM 总结被裁剪的消息
+        2. 写入每日记忆文件
+        3. 注入摘要到当前对话（保持上下文连续性）
+        """
+        msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
+
+        # 创建摘要注入回调
+        def on_summary_ready(summary: str):
+            self.context.inject_context_summary(summary)
+
+        self.flusher.flush_messages(
+            messages=msg_dicts,
+            user_id=self.user_id,
+            api_base=self.config.api_base,
+            api_key=self.config.api_key,
+            model=self.config.model,
+            context_summary_callback=on_summary_ready
+        )
+
     def flush(self) -> bool:
         """
-        总结对话并写入每日记忆
+        手动 flush 当前对话到每日记忆
 
         Returns:
             是否成功写入
@@ -552,3 +608,41 @@ class SimpleAgent:
             api_key=self.config.api_key,
             model=self.config.model
         )
+
+    def distill(self, lookback_days: int = None) -> bool:
+        """
+        手动触发记忆蒸馏
+
+        Args:
+            lookback_days: 回看天数（默认使用配置值）
+
+        Returns:
+            是否成功执行蒸馏
+        """
+        lookback = lookback_days or self.config.deep_dream_lookback
+        return self.deep_dream.distill_with_config(
+            user_id=self.user_id,
+            lookback_days=lookback,
+            api_base=self.config.api_base,
+            api_key=self.config.api_key,
+            model=self.config.model
+        )
+
+    def exit(self):
+        """
+        退出时处理
+
+        流程:
+        1. Flush 剩余对话到每日记忆
+        2. Deep Dream 蒸馏近期记忆
+        3. 保存上下文
+        """
+        # 1. Flush 剩余对话
+        if self.context.messages:
+            self.flush()
+
+        # 2. Deep Dream 蒸馏
+        self.distill()
+
+        # 3. 保存上下文（自动保存已启用，这里显式确认）
+        self.context._save_history()

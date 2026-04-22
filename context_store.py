@@ -174,15 +174,27 @@ class ContextStore:
         self.conn.close()
 
 
-# 全局单例
-_context_store: Optional[ContextStore] = None
+# 全局单例（按 db_path 存储）
+_context_stores: Dict[str, ContextStore] = {}
 
 
 def get_context_store(db_path: str = None) -> ContextStore:
-    """获取全局 ContextStore 实例"""
-    global _context_store
-    if _context_store is None:
-        if db_path is None:
-            db_path = "context.db"
-        _context_store = ContextStore(db_path)
-    return _context_store
+    """获取或创建 ContextStore 实例（按 db_path 缓存）"""
+    if db_path is None:
+        db_path = "context.db"
+
+    if db_path not in _context_stores:
+        _context_stores[db_path] = ContextStore(db_path)
+
+    return _context_stores[db_path]
+
+
+def reset_context_store():
+    """重置全局单例（用于测试）"""
+    global _context_stores
+    for store in _context_stores.values():
+        try:
+            store.close()
+        except Exception:
+            pass
+    _context_stores = {}
