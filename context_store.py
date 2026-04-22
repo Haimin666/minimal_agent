@@ -130,6 +130,13 @@ class ContextStore:
         ).fetchone()[0]
         return {"sessions": count}
 
+    def get_all_users(self) -> List[str]:
+        """获取所有有会话记录的用户 ID 列表（按最近更新时间排序）"""
+        rows = self.conn.execute(
+            "SELECT DISTINCT user_id FROM sessions WHERE user_id IS NOT NULL ORDER BY updated_at DESC"
+        ).fetchall()
+        return [row['user_id'] for row in rows]
+
     @staticmethod
     def _filter_text_messages(messages: List[Dict]) -> List[Dict]:
         """

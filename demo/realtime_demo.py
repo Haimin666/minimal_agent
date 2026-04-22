@@ -3,7 +3,8 @@
 🚗 汽车语音助手 - 真实场景交互 Demo (增强版)
 
 启动命令:
-    python demo/realtime_demo.py
+    python demo/realtime_demo.py              # 交互式选择用户
+    python demo/realtime_demo.py -c USER_ID   # 继续指定用户的会话
 
 功能:
     1. 选择/创建用户身份
@@ -14,6 +15,7 @@
 
 import sys
 import os
+import argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datetime import datetime
@@ -22,6 +24,7 @@ from config import Config
 from agent import SimpleAgent
 from memory import MemoryStorage, MemoryChunk
 from profession_generator import USER_TEMPLATES, generate_user_memory
+from context_store import get_context_store
 import json
 import io
 import contextlib
@@ -37,7 +40,7 @@ from prompt_toolkit.key_binding import KeyBindings
 class RealTimeDemo:
     """真实场景演示"""
 
-    def __init__(self):
+    def __init__(self, continue_user: str = None):
         # 获取项目根目录（demo 的父目录）
         project_root = Path(__file__).parent.parent
 
@@ -56,6 +59,7 @@ class RealTimeDemo:
         self.dialogue_count = 0
         self.user_name = None
         self.user_template = None
+        self.continue_user = continue_user  # 命令行指定的用户
 
         # 自定义样式
         self.style = Style.from_dict({
@@ -68,7 +72,7 @@ class RealTimeDemo:
 
         # 命令补全
         self.command_completer = WordCompleter([
-            'history', 'prompt', 'messages', 'memory', 'save', 'flush', 'clear', 'q', 'help'
+            'history', 'prompt', 'messages', 'memory', 'save', 'flush', 'dream', 'clear', 'q', 'help'
         ])
 
         # 历史记录
@@ -91,13 +95,48 @@ class RealTimeDemo:
         print(f"   对话: {self.config.model} @ {self.config.api_base}")
         print(f"   嵌入: {self.config.embedding_model} @ {self.config.embedding_api_base}")
 
+        # 如果命令行指定了用户，直接继续该用户的会话
+        if self.continue_user:
+            self.user_id = self.continue_user
+            self.user_name = self.continue_user
+            self.user_template = USER_TEMPLATES.get(self.user_id)
+
+            print(f"\n✅ 继续用户会话: {self.user_id}")
+
+            if self.user_template:
+                self._print_user_profile()
+
+            self._create_agent_silent()
+            self.interactive_loop()
+            return
+
+        # 获取已有用户列表
+        context_db_path = Path(self.config.workspace_dir) / self.config.context_db_path
+        context_store = get_context_store(str(context_db_path))
+        existing_users = context_store.get_all_users()
+
         # 选择或创建用户
         print("\n" + "-" * 50)
         print("请选择用户身份:")
-        for i, (user_id, t) in enumerate(USER_TEMPLATES.items(), 1):
-            print(f"  {i}. {t['name']:6} ({t['profession']})")
-        print(f"  {len(USER_TEMPLATES) + 1}. 新用户 (自定义)")
+
+        # 显示预设用户
+        preset_user_ids = list(USER_TEMPLATES.keys())
+        for i, user_id in enumerate(preset_user_ids, 1):
+            t = USER_TEMPLATES[user_id]
+            marker = " 📜" if user_id in existing_users else ""
+            print(f"  {i}. {t['name']:6} ({t['profession']}){marker}")
+
+        # 显示已有但非预设的用户
+        new_users = [u for u in existing_users if u not in preset_user_ids]
+        next_idx = len(preset_user_ids) + 1
+        for i, user_id in enumerate(new_users, next_idx):
+            print(f"  {i}. {user_id} 📜 (已有会话)")
+
+        # 新用户选项
+        new_user_idx = len(preset_user_ids) + len(new_users) + 1
+        print(f"  {new_user_idx}. 新用户 (自定义)")
         print("-" * 50)
+        print("  💡 标记 📜 表示有历史会话记录")
 
         try:
             choice = input("\n请输入选项: ").strip()
@@ -105,25 +144,23 @@ class RealTimeDemo:
             return
 
         # 用户选择映射
-        user_ids = list(USER_TEMPLATES.keys())
+        all_user_ids = preset_user_ids + new_users
 
-        if choice.isdigit() and 1 <= int(choice) <= len(user_ids):
-            self.user_id = user_ids[int(choice) - 1]
-            self.user_template = USER_TEMPLATES[self.user_id]
-            self.user_name = self.user_template['name']
+        if choice.isdigit() and 1 <= int(choice) <= len(all_user_ids):
+            self.user_id = all_user_ids[int(choice) - 1]
+            self.user_template = USER_TEMPLATES.get(self.user_id)
+            self.user_name = self.user_template['name'] if self.user_template else self.user_id
 
-            print(f"\n✅ 已选择用户: {self.user_name} ({self.user_template['profession']})")
+            if self.user_template:
+                print(f"\n✅ 已选择用户: {self.user_name} ({self.user_template['profession']})")
+                self._print_user_profile()
+                self._create_agent_silent()
+                self._generate_user_memory()
+            else:
+                print(f"\n✅ 已选择用户: {self.user_id}")
+                self._create_agent_silent()
 
-            # 打印详细人设
-            self._print_user_profile()
-
-            # 创建 Agent
-            self._create_agent_silent()
-
-            # 生成记忆文件
-            self._generate_user_memory()
-
-        elif choice == str(len(user_ids) + 1):
+        elif choice == str(new_user_idx):
             try:
                 self.user_id = input("请输入用户ID或姓名: ").strip()
                 if not self.user_id:
@@ -167,9 +204,20 @@ class RealTimeDemo:
         print(f"{'─' * 50}")
 
     def _generate_user_memory(self):
-        """生成用户记忆文件"""
+        """生成用户记忆文件（仅在首次创建时）"""
         today = datetime.now().strftime("%Y-%m-%d")
+        memory_dir = Path(self.config.workspace_dir) / "memory" / "users" / self.user_id
 
+        # 检查是否已有记忆文件
+        memory_file = memory_dir / "MEMORY.md"
+        if memory_file.exists():
+            print(f"\n   📁 已存在记忆文件，跳过生成")
+            # 仍需同步到数据库
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.agent.memory_manager.sync_from_files()
+            return
+
+        # 首次创建，生成记忆文件
         with contextlib.redirect_stdout(io.StringIO()):
             result = generate_user_memory(self.user_id, self.user_template, self.config.workspace_dir)
             # 同步到数据库
@@ -280,6 +328,9 @@ class RealTimeDemo:
             elif cmd == "flush":
                 self._do_flush()
 
+            elif cmd == "dream":
+                self._do_dream(arg)
+
             else:
                 # 对话
                 self.chat(user_input)
@@ -314,22 +365,64 @@ class RealTimeDemo:
         else:
             print("ℹ️  对话内容无记录价值，未写入")
 
+    def _do_dream(self, arg: str):
+        """蒸馏近期记忆到长期记忆"""
+        # 解析参数
+        args = arg.split() if arg else []
+        user_scope = "--user" in args
+        lookback_days = 3  # 默认
+
+        # 解析 --days N
+        if "--days" in args:
+            try:
+                idx = args.index("--days")
+                lookback_days = int(args[idx + 1])
+            except (ValueError, IndexError):
+                print("❌ 用法: dream --days N")
+                return
+
+        # 决定目标
+        if user_scope:
+            target = "用户私有"
+            user_id = self.user_id
+        else:
+            target = "共享"
+            user_id = None
+
+        print(f"\n[INFO] 正在蒸馏近期记忆...")
+        print(f"   目标: {target}长期记忆")
+        print(f"   回看: {lookback_days} 天")
+
+        # 调用蒸馏
+        success = self.agent.deep_dream.distill_with_config(
+            user_id=user_id,
+            lookback_days=lookback_days,
+            api_base=self.config.api_base,
+            api_key=self.config.api_key,
+            model=self.config.model
+        )
+
+        if success:
+            if user_scope:
+                path = f"memory/users/{self.user_id}/MEMORY.md"
+            else:
+                path = "MEMORY.md"
+            print(f"✅ 记忆蒸馏完成")
+            print(f"   文件: {path}")
+        else:
+            print("ℹ️  无需更新（无新内容或蒸馏失败）")
+
     def _auto_flush_on_exit(self):
         """退出时自动总结对话并蒸馏记忆"""
-        # 调用 agent.exit() 完成完整的退出流程：
-        # 1. Flush 剩余对话到每日记忆
-        # 2. Deep Dream 蒸馏近期记忆 → 更新长期记忆
-        # 3. 保存上下文
-        print(f"\n🔄 正在处理退出流程...")
-
         # 检查是否有对话历史
         messages = self.agent.context.get_openai_messages()
-        if messages:
-            print(f"   1. 总结本次对话...")
-            print(f"   2. 蒸馏近期记忆...")
-        else:
-            print(f"   1. 无对话需要总结")
-            print(f"   2. 蒸馏近期记忆...")
+        if not messages:
+            # 无对话，直接退出
+            return
+
+        print(f"\n🔄 正在处理退出流程...")
+        print(f"   1. 总结本次对话...")
+        print(f"   2. 蒸馏近期记忆...")
 
         # 调用完整的 exit 流程
         self.agent.exit()
@@ -561,6 +654,9 @@ class RealTimeDemo:
 ║  memory <关键词> 搜索记忆                                            ║
 ║  save <内容>    主动保存记忆                                         ║
 ║  flush           总结对话并写入每日记忆                               ║
+║  dream           蒸馏近期记忆到共享长期记忆 (MEMORY.md)               ║
+║  dream --user    蒸馏近期记忆到用户私有长期记忆                       ║
+║  dream --days N  指定回看天数 (默认3天)                              ║
 ║  clear          清空对话历史                                         ║
 ║  help           显示此帮助                                           ║
 ║  q              退出（自动 flush + distill 更新长期记忆）             ║
@@ -579,7 +675,12 @@ class RealTimeDemo:
 
 
 def main():
-    demo = RealTimeDemo()
+    parser = argparse.ArgumentParser(description='汽车语音助手 - 真实场景交互 Demo')
+    parser.add_argument('-c', '--continue', dest='user_id', metavar='USER_ID',
+                        help='继续指定用户的会话')
+    args = parser.parse_args()
+
+    demo = RealTimeDemo(continue_user=args.user_id)
     demo.start()
 
 
