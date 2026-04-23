@@ -28,6 +28,8 @@ venv/
 ENV/
 env/
 .venv/
+CLAUDE.md
+FEATURES.md
 
 # IDE
 .idea/
