@@ -45,8 +45,11 @@ class MemoryStorage:
 
     def __init__(self, db_path: str = "memory.db"):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
+        # 启用 WAL 模式支持并发读写
+        self.conn = sqlite3.connect(db_path, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self._init_db()
 
     def _init_db(self):

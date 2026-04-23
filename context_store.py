@@ -5,6 +5,7 @@ Session 历史持久化 - SQLite 存储
     - 保存对话历史到 SQLite
     - 重启时恢复最近 N 轮对话
     - 支持多用户隔离
+    - 启用 WAL 模式支持并发读写
 """
 
 import sqlite3
@@ -12,6 +13,9 @@ import json
 from typing import List, Dict, Optional
 from pathlib import Path
 from datetime import datetime
+
+# 默认工作空间目录
+DEFAULT_WORKSPACE = "./workspace"
 
 
 class ContextStore:
@@ -28,10 +32,35 @@ class ContextStore:
         )
     """
 
-    def __init__(self, db_path: str = "context.db"):
+    def __init__(self, db_path: str = None, workspace_dir: str = None):
+        """
+        初始化存储
+
+        Args:
+            db_path: 数据库路径（绝对路径或相对路径）
+            workspace_dir: 工作空间目录（当 db_path 为相对路径时使用）
+        """
+        # 确定数据库路径
+        if db_path is None:
+            workspace = workspace_dir or DEFAULT_WORKSPACE
+            db_path = f"{workspace}/context.db"
+        elif not Path(db_path).is_absolute():
+            # 相对路径：基于工作空间目录
+            workspace = workspace_dir or DEFAULT_WORKSPACE
+            db_path = f"{workspace}/{db_path}"
+
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
+
+        # 确保目录存在
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
+        self.conn = sqlite3.connect(db_path, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
+
+        # 启用 WAL 模式（支持并发读写）
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+
         self._init_db()
 
     def _init_db(self):
@@ -61,11 +90,12 @@ class ContextStore:
         """
         messages_json = json.dumps(messages, ensure_ascii=False)
 
-        self.conn.execute("""
-            INSERT OR REPLACE INTO sessions (session_id, user_id, messages, updated_at)
-            VALUES (?, ?, ?, strftime('%s', 'now'))
-        """, (session_id, user_id, messages_json))
-        self.conn.commit()
+        # 使用事务保护
+        with self.conn:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO sessions (session_id, user_id, messages, updated_at)
+                VALUES (?, ?, ?, strftime('%s', 'now'))
+            """, (session_id, user_id, messages_json))
 
     def load_messages(
         self,
@@ -109,19 +139,19 @@ class ContextStore:
 
     def clear_session(self, session_id: str):
         """清空指定会话"""
-        self.conn.execute(
-            "DELETE FROM sessions WHERE session_id = ?",
-            (session_id,)
-        )
-        self.conn.commit()
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM sessions WHERE session_id = ?",
+                (session_id,)
+            )
 
     def clear_user_sessions(self, user_id: str):
         """清空用户所有会话"""
-        self.conn.execute(
-            "DELETE FROM sessions WHERE user_id = ?",
-            (user_id,)
-        )
-        self.conn.commit()
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM sessions WHERE user_id = ?",
+                (user_id,)
+            )
 
     def get_stats(self) -> Dict:
         """获取统计信息"""
@@ -185,15 +215,28 @@ class ContextStore:
 _context_stores: Dict[str, ContextStore] = {}
 
 
-def get_context_store(db_path: str = None) -> ContextStore:
-    """获取或创建 ContextStore 实例（按 db_path 缓存）"""
+def get_context_store(db_path: str = None, workspace_dir: str = None) -> ContextStore:
+    """
+    获取或创建 ContextStore 实例（按 db_path 缓存）
+
+    Args:
+        db_path: 数据库路径（绝对路径或相对路径）
+        workspace_dir: 工作空间目录（当 db_path 为相对路径时使用）
+    """
+    # 确定实际路径（与 ContextStore.__init__ 逻辑一致）
     if db_path is None:
-        db_path = "context.db"
+        workspace = workspace_dir or DEFAULT_WORKSPACE
+        actual_path = f"{workspace}/context.db"
+    elif not Path(db_path).is_absolute():
+        workspace = workspace_dir or DEFAULT_WORKSPACE
+        actual_path = f"{workspace}/{db_path}"
+    else:
+        actual_path = db_path
 
-    if db_path not in _context_stores:
-        _context_stores[db_path] = ContextStore(db_path)
+    if actual_path not in _context_stores:
+        _context_stores[actual_path] = ContextStore(actual_path)
 
-    return _context_stores[db_path]
+    return _context_stores[actual_path]
 
 
 def reset_context_store():

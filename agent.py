@@ -280,15 +280,18 @@ class SimpleAgent:
 
         system_prompt = self._build_system_prompt(context_files)
 
-        # 2. 搜索相关记忆（混合检索：向量 + 关键词）
+        # 2. 构建上下文感知的检索查询
+        search_query = self._build_context_aware_query(user_input)
+
+        # 3. 搜索相关记忆（混合检索：向量 + 关键词）
         memories = self.memory_manager.search(
-            query=user_input,
+            query=search_query,
             user_id=self.user_id,
             limit=5,
             include_shared=True
         )
 
-        # 3. 构建消息列表
+        # 4. 构建消息列表
         messages = [{"role": "system", "content": system_prompt}]
 
         # 注入记忆上下文
@@ -305,14 +308,14 @@ class SimpleAgent:
         # 添加当前输入
         messages.append({"role": "user", "content": user_input})
 
-        # 4. 调用 LLM（支持工具调用）
+        # 5. 调用 LLM（支持工具调用）
         response = self._call_llm_with_tools(messages)
 
-        # 5. 保存历史（可能触发裁剪）
+        # 6. 保存历史（可能触发裁剪）
         discarded = self.context.add_message("user", user_input)
         self.context.add_message("assistant", response["content"])
 
-        # 6. 如果触发了裁剪，flush 被裁剪的消息并注入摘要
+        # 7. 如果触发了裁剪，flush 被裁剪的消息并注入摘要
         if discarded:
             self._flush_discarded(discarded)
             flushed = True
@@ -323,6 +326,48 @@ class SimpleAgent:
             "memories_found": len(memories),
             "flushed": flushed
         }
+
+    def _build_context_aware_query(self, user_input: str) -> str:
+        """
+        构建上下文感知的检索查询
+
+        结合最近对话历史，增强检索效果
+
+        Args:
+            user_input: 用户当前输入
+
+        Returns:
+            增强后的检索查询
+        """
+        # 获取最近的对话（最多 2 轮）
+        recent_messages = self.context.messages[-4:] if self.context.messages else []
+
+        if not recent_messages:
+            return user_input
+
+        # 提取最近对话的关键信息
+        context_keywords = []
+        for msg in recent_messages:
+            content = msg.content
+            # 提取实体词（简单规则）
+            import re
+            # 提取人名、地点、时间等关键词
+            entities = re.findall(r'[\u4e00-\u9fff]{2,4}(?:老师|医生|先生|女士|公司|学校|医院)', content)
+            context_keywords.extend(entities)
+
+            # 提取时间词
+            time_words = re.findall(r'(今天|明天|昨天|下周|上周|周末)', content)
+            context_keywords.extend(time_words)
+
+        # 去重
+        context_keywords = list(set(context_keywords))[:3]
+
+        if context_keywords:
+            # 组合查询：上下文关键词 + 用户输入
+            enhanced_query = f"{user_input} {' '.join(context_keywords)}"
+            return enhanced_query
+
+        return user_input
 
     def _build_system_prompt(self, context_files: list) -> str:
         """构建系统提示词"""

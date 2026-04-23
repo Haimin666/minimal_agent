@@ -2,7 +2,7 @@
 
 设计原则：
 - 只追加写入，不实时编辑
-- 仅向量检索（移除关键词兜底）
+- 支持层次化检索（三级索引）
 - 冲突/更新由 Deep Dream 延迟处理
 """
 
@@ -33,6 +33,10 @@ class MemoryManager:
                 ├── MEMORY.md      # 用户长期记忆
                 └── YYYY-MM-DD.md  # 用户每日记忆
 
+    检索模式：
+    - 传统模式：向量 + 关键词混合检索
+    - 层次化模式：标题 → 块摘要 → 块内容（三级索引）
+
     更新机制：
     - 新记忆 → 直接追加到当日文件末尾
     - 冲突检测 → 由 Deep Dream 延迟处理
@@ -45,10 +49,26 @@ class MemoryManager:
         workspace_dir: str = "./workspace",
         chunk_max_tokens: int = 500,
         chunk_overlap_tokens: int = 50,
+        # LLM 配置（用于层次化索引的摘要生成）
+        api_base: str = None,
+        api_key: str = None,
+        model: str = None,
+        # 是否启用层次化索引
+        enable_hierarchical: bool = True,
+        # Rerank 配置
+        rerank_api_base: str = None,
+        rerank_api_key: str = None,
+        rerank_model: str = None,
+        rerank_top_n: int = 5,
+        rerank_enabled: bool = True,
     ):
         self.storage = storage or MemoryStorage()
         self.embedding_provider = embedding_provider
         self.workspace_dir = Path(workspace_dir)
+        self.api_base = api_base
+        self.api_key = api_key
+        self.model = model
+        self.enable_hierarchical = enable_hierarchical
 
         self.chunker = TextChunker(
             max_tokens=chunk_max_tokens,
@@ -61,6 +81,36 @@ class MemoryManager:
         (self.memory_dir / "shared").mkdir(exist_ok=True)
         (self.memory_dir / "users").mkdir(exist_ok=True)
 
+        # 语义组织器
+        try:
+            from .semantic_organizer import SemanticOrganizer
+            self.semantic_organizer = SemanticOrganizer(embedding_provider)
+        except ImportError:
+            from semantic_organizer import SemanticOrganizer
+            self.semantic_organizer = SemanticOrganizer(embedding_provider)
+
+        # 层次化索引
+        self.hierarchical_index = None
+        if enable_hierarchical:
+            try:
+                from .hierarchical_index import HierarchicalIndex
+                db_path = str(self.workspace_dir / "memory.db")
+                self.hierarchical_index = HierarchicalIndex(
+                    db_path=db_path,
+                    embedding_provider=embedding_provider,
+                    api_base=api_base,
+                    api_key=api_key,
+                    model=model,
+                    # Rerank 配置
+                    rerank_api_base=rerank_api_base,
+                    rerank_api_key=rerank_api_key,
+                    rerank_model=rerank_model,
+                    rerank_top_n=rerank_top_n,
+                    rerank_enabled=rerank_enabled,
+                )
+            except ImportError:
+                pass
+
     # ==================== 添加记忆 ====================
 
     def add_memory(
@@ -72,13 +122,13 @@ class MemoryManager:
         **metadata
     ) -> str:
         """
-        添加记忆 - 只追加，不检测相似度
+        添加记忆 - 使用 SemanticOrganizer 组织
 
         Args:
             content: 记忆内容（单行）
             user_id: 用户 ID
             scope: 记忆范围 (shared | user)
-            tags: 语义标签列表，例如 ['职业:教师', '科目:语文']
+            tags: 语义标签列表（已废弃，保留兼容性）
 
         Returns:
             文件路径
@@ -89,23 +139,25 @@ class MemoryManager:
         # 格式化为一行
         line_content = content.strip().replace('\n', ' ')
 
-        # 附加标签到内容末尾（提高检索效果）
-        # 标签格式: [职业:教师] [科目:语文]
-        if tags:
-            tag_str = ' '.join(f'[{tag}]' for tag in tags)
-            line_content = f"{line_content} {tag_str}"
-
-        if not line_content.startswith('- '):
-            line_content = f"- {line_content}"
-
         # 获取当日文件路径
         path = self._get_today_path(user_id, scope)
+        file_path = self.workspace_dir / path
 
-        # 追加到文件末尾
-        line_num = self._append_to_file(path, line_content)
+        # 使用 SemanticOrganizer 写入（如果可用）
+        if hasattr(self, 'semantic_organizer') and self.semantic_organizer:
+            self.semantic_organizer.organize_and_write(
+                file_path,
+                [line_content],
+                header=f"# Daily Memory: {datetime.now().strftime('%Y-%m-%d')}"
+            )
+        else:
+            # 回退：简单追加
+            if not line_content.startswith('- '):
+                line_content = f"- {line_content}"
+            line_num = self._append_to_file(path, line_content)
 
         # 同步到数据库
-        self._sync_single_line(path, line_num, line_content, user_id, scope)
+        self._sync_from_file(path)
 
         return path
 
@@ -192,9 +244,12 @@ class MemoryManager:
         include_shared: bool = True,
         vector_weight: float = 0.7,
         keyword_weight: float = 0.3,
+        use_hierarchical: bool = None,
+        use_rerank: bool = True,
+        use_multi_query: bool = True,
     ) -> List[SearchResult]:
         """
-        搜索记忆 - 混合检索（向量 + 关键词），与 CowAgent 一致
+        搜索记忆
 
         Args:
             query: 搜索关键词
@@ -203,7 +258,71 @@ class MemoryManager:
             include_shared: 是否包含共享记忆
             vector_weight: 向量检索权重
             keyword_weight: 关键词检索权重
+            use_hierarchical: 是否使用层次化检索（None 表示自动选择）
+            use_rerank: 是否使用 Rerank 重排序
+            use_multi_query: 是否使用多查询融合
+
+        Returns:
+            检索结果列表
         """
+        # 自动选择检索模式
+        if use_hierarchical is None:
+            use_hierarchical = self.hierarchical_index is not None
+
+        # 层次化检索
+        if use_hierarchical and self.hierarchical_index:
+            return self._search_hierarchical(query, user_id, limit, use_rerank, use_multi_query)
+
+        # 传统混合检索
+        return self._search_hybrid(
+            query, user_id, limit, include_shared, vector_weight, keyword_weight
+        )
+
+    def _search_hierarchical(
+        self,
+        query: str,
+        user_id: str = None,
+        limit: int = 10,
+        use_rerank: bool = True,
+        use_multi_query: bool = True,
+    ) -> List[SearchResult]:
+        """层次化检索（三级索引）"""
+        results = self.hierarchical_index.search(
+            query=query,
+            user_id=user_id,
+            limit=limit,
+            use_hyde=True,
+            use_rerank=use_rerank,
+            use_multi_query=use_multi_query
+        )
+
+        # 转换为 SearchResult 格式
+        search_results = []
+        for r in results:
+            # 优先使用结果中的 user_id，其次使用传入的 user_id
+            result_user_id = r.get('user_id') or user_id
+            search_results.append(SearchResult(
+                path=r.get('file_path', ''),
+                start_line=1,
+                end_line=1,
+                score=r.get('score', 0.0),
+                snippet=r.get('content', '')[:500],
+                scope='user' if result_user_id else 'shared',
+                user_id=result_user_id
+            ))
+
+        return search_results
+
+    def _search_hybrid(
+        self,
+        query: str,
+        user_id: str = None,
+        limit: int = 10,
+        include_shared: bool = True,
+        vector_weight: float = 0.7,
+        keyword_weight: float = 0.3,
+    ) -> List[SearchResult]:
+        """传统混合检索（向量 + 关键词）"""
         scopes = ["user"]
         if include_shared:
             scopes.append("shared")
@@ -417,3 +536,31 @@ class MemoryManager:
         # 更新文件 hash
         stat = file_path.stat()
         self.storage.update_file_hash(rel_path, file_hash, int(stat.st_mtime), stat.st_size)
+
+        # 同步到层次化索引
+        if self.hierarchical_index:
+            try:
+                self.hierarchical_index.index_file(rel_path, content)
+            except Exception:
+                pass  # 层次化索引失败不影响主流程
+
+    def _sync_from_file(self, rel_path: str):
+        """同步单个文件到数据库"""
+        file_path = self.workspace_dir / rel_path
+        if not file_path.exists():
+            return
+
+        # 从路径解析 scope 和 user_id
+        if "memory/shared/" in rel_path:
+            scope = "shared"
+            user_id = None
+        else:
+            scope = "user"
+            # 从路径提取 user_id: memory/users/{user_id}/...
+            parts = rel_path.split("/")
+            if len(parts) >= 3 and parts[1] == "users":
+                user_id = parts[2]
+            else:
+                user_id = None
+
+        self._sync_file(file_path, rel_path, scope, user_id)

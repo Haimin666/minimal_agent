@@ -6,12 +6,18 @@
     - 写入每日记忆文件
     - 支持手动触发和自动触发
     - 上下文摘要注入（可选）
+    - 语义组织：按标题分块 + 语义去重
 """
 
 from typing import List, Dict, Optional, Any, Callable
 from pathlib import Path
 from datetime import datetime
 import hashlib
+
+try:
+    from .semantic_organizer import SemanticOrganizer
+except ImportError:
+    from semantic_organizer import SemanticOrganizer
 
 
 # LLM 总结提示词
@@ -41,6 +47,7 @@ class MemoryFlusher:
     对话总结 Flush
 
     将对话历史总结后写入每日记忆文件（YYYY-MM-DD.md）
+    支持语义组织：按标题分块 + 语义去重
     """
 
     def __init__(
@@ -58,6 +65,9 @@ class MemoryFlusher:
 
         # 内容去重
         self._last_flush_hash: str = ""
+
+        # 语义组织器
+        self.semantic_organizer = SemanticOrganizer(embedding_provider)
 
     def get_today_file(self, user_id: Optional[str] = None, ensure_exists: bool = False) -> Path:
         """获取今日记忆文件路径"""
@@ -217,13 +227,17 @@ class MemoryFlusher:
         return "\n".join(events[:5])
 
     def _write_daily(self, summary: str, user_id: Optional[str] = None):
-        """写入每日记忆文件"""
+        """写入每日记忆文件 - 使用语义组织器"""
         today_file = self.get_today_file(user_id, ensure_exists=True)
 
-        # 追加内容
-        header = f"\n## Session {datetime.now().strftime('%H:%M')}\n\n"
-        with open(today_file, "a", encoding="utf-8") as f:
-            f.write(header + summary + "\n")
+        # 解析 summary 为条目列表
+        items = self._parse_summary_to_items(summary)
+        if not items:
+            return
+
+        # 使用语义组织器写入
+        header = f"# Daily Memory: {datetime.now().strftime('%Y-%m-%d')}"
+        self.semantic_organizer.organize_and_write(today_file, items, header)
 
         # 同步到数据库
         if self.memory_manager:
@@ -231,3 +245,19 @@ class MemoryFlusher:
                 self.memory_manager.sync_from_files()
             except Exception:
                 pass
+
+    def _parse_summary_to_items(self, summary: str) -> List[str]:
+        """解析 summary 为条目列表"""
+        items = []
+        for line in summary.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            # 移除 "- " 前缀
+            if line.startswith("- "):
+                line = line[2:]
+            # 跳过标题行
+            if line.startswith("#"):
+                continue
+            items.append(line)
+        return items
