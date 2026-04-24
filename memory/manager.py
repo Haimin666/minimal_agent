@@ -101,8 +101,12 @@ class MemoryManager:
         # 获取当日文件路径
         path = self._get_today_path(user_id, scope)
 
-        # 追加到文件末尾
+        # 追加到文件末尾（带去重）
         line_num = self._append_to_file(path, line_content)
+
+        # 如果重复，不写入数据库
+        if line_num == -1:
+            return path  # 已存在，跳过
 
         # 同步到数据库
         self._sync_single_line(path, line_num, line_content, user_id, scope)
@@ -119,13 +123,30 @@ class MemoryManager:
             return f"memory/users/{user_id}/{today}.md"
 
     def _append_to_file(self, path: str, line_content: str) -> int:
-        """追加一行到文件，返回行号"""
+        """追加一行到文件（带去重），返回行号，重复返回 -1"""
         file_path = self.workspace_dir / path
         file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # 提取纯内容用于去重比较（移除标签和前缀）
+        def normalize(s):
+            # 移除 "- " 前缀和 [标签]
+            s = re.sub(r'^-\s*', '', s.strip())
+            s = re.sub(r'\s*\[[^\]]+\]', '', s)
+            # 归一化标点
+            s = s.replace('，', ',').replace('。', '').lower()
+            return s.strip()
+
+        normalized_new = normalize(line_content)
 
         if file_path.exists():
             content = file_path.read_text(encoding='utf-8')
             lines = content.split('\n')
+
+            # 检查是否已存在相同内容
+            for line in lines:
+                if normalize(line) == normalized_new:
+                    return -1  # 重复，不写入
+
             # 找到最后一个非空行
             last_line = len(lines)
             for i in range(len(lines) - 1, -1, -1):

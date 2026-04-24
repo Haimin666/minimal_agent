@@ -217,13 +217,42 @@ class MemoryFlusher:
         return "\n".join(events[:5])
 
     def _write_daily(self, summary: str, user_id: Optional[str] = None):
-        """写入每日记忆文件"""
+        """写入每日记忆文件（带去重）"""
         today_file = self.get_today_file(user_id, ensure_exists=True)
+
+        # 读取现有内容，检查重复
+        existing_content = ""
+        if today_file.exists():
+            existing_content = today_file.read_text(encoding='utf-8')
+
+        # 解析现有条目（提取所有 "- " 开头的行）
+        existing_items = set()
+        for line in existing_content.split('\n'):
+            line = line.strip()
+            if line.startswith('- '):
+                # 归一化：移除标点差异，统一格式
+                normalized = line.lower().replace('，', ',').replace('。', '').strip()
+                existing_items.add(normalized)
+
+        # 过滤新条目，只添加不重复的
+        new_lines = []
+        for line in summary.split('\n'):
+            line = line.strip()
+            if line.startswith('- '):
+                normalized = line.lower().replace('，', ',').replace('。', '').strip()
+                if normalized not in existing_items:
+                    new_lines.append(line)
+                    existing_items.add(normalized)  # 防止同一次写入重复
+            elif line:  # 保留非条目行（如标题）
+                new_lines.append(line)
+
+        if not new_lines:
+            return  # 无新内容
 
         # 追加内容
         header = f"\n## Session {datetime.now().strftime('%H:%M')}\n\n"
         with open(today_file, "a", encoding="utf-8") as f:
-            f.write(header + summary + "\n")
+            f.write(header + '\n'.join(new_lines) + "\n")
 
         # 同步到数据库
         if self.memory_manager:
