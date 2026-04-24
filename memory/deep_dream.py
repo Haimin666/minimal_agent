@@ -366,12 +366,22 @@ class DeepDream:
         else:
             memory_file = self.workspace_dir / "MEMORY.md"
 
-        # 限制条目数
+        # 保留结构：## 标题 和 - 条目
         lines = content.strip().split("\n")
-        items = [l for l in lines if l.strip().startswith("-")]
-        items = items[:self.max_items]
+        kept_lines = []
+        item_count = 0
+        for line in lines:
+            stripped = line.strip()
+            # 保留标题行
+            if stripped.startswith("## "):
+                kept_lines.append(line)
+            # 保留条目行（限制数量）
+            elif stripped.startswith("- "):
+                if item_count < self.max_items:
+                    kept_lines.append(line)
+                    item_count += 1
 
         # 写入文件
         today = datetime.now().strftime("%Y-%m-%d")
         header = f"# MEMORY.md\n\n最后更新: {today}\n\n"
-        memory_file.write_text(header + "\n".join(items) + "\n", encoding="utf-8")
+        memory_file.write_text(header + "\n".join(kept_lines) + "\n", encoding="utf-8")

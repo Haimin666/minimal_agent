@@ -217,42 +217,64 @@ class MemoryFlusher:
         return "\n".join(events[:5])
 
     def _write_daily(self, summary: str, user_id: Optional[str] = None):
-        """写入每日记忆文件（带去重）"""
+        """写入每日记忆文件（带语义去重）"""
         today_file = self.get_today_file(user_id, ensure_exists=True)
 
-        # 读取现有内容，检查重复
+        # 读取现有内容
         existing_content = ""
         if today_file.exists():
             existing_content = today_file.read_text(encoding='utf-8')
 
-        # 解析现有条目（提取所有 "- " 开头的行）
-        existing_items = set()
+        # 提取现有条目
+        existing_items = []
         for line in existing_content.split('\n'):
             line = line.strip()
             if line.startswith('- '):
-                # 归一化：移除标点差异，统一格式
-                normalized = line.lower().replace('，', ',').replace('。', '').strip()
-                existing_items.add(normalized)
+                existing_items.append(line)
 
-        # 过滤新条目，只添加不重复的
-        new_lines = []
+        # 提取新条目
+        new_items = []
         for line in summary.split('\n'):
             line = line.strip()
             if line.startswith('- '):
-                normalized = line.lower().replace('，', ',').replace('。', '').strip()
-                if normalized not in existing_items:
-                    new_lines.append(line)
-                    existing_items.add(normalized)  # 防止同一次写入重复
-            elif line:  # 保留非条目行（如标题）
-                new_lines.append(line)
+                new_items.append(line)
 
-        if not new_lines:
+        if not new_items:
             return  # 无新内容
+
+        # 使用向量相似度去重
+        if self.embedding_provider and existing_items:
+            # 获取现有条目的向量
+            existing_embeddings = self.embedding_provider.embed_batch(existing_items)
+            # 获取新条目的向量
+            new_embeddings = self.embedding_provider.embed_batch(new_items)
+
+            # 过滤：只保留与现有条目相似度 < 0.85 的
+            filtered_items = []
+            for i, new_emb in enumerate(new_embeddings):
+                is_duplicate = False
+                max_sim = 0
+                for exist_emb in existing_embeddings:
+                    similarity = self._cosine_similarity(new_emb, exist_emb)
+                    max_sim = max(max_sim, similarity)
+                    if similarity >= 0.80:  # 相似度阈值
+                        is_duplicate = True
+                        break
+                print(f"[Flush] '{new_items[i][:30]}...' max_sim={max_sim:.3f} {'❌跳过' if is_duplicate else '✅保留'}")
+                if not is_duplicate:
+                    filtered_items.append(new_items[i])
+            new_items = filtered_items
+        else:
+            # 无向量能力时，简单字符串去重
+            new_items = [item for item in new_items if item not in existing_items]
+
+        if not new_items:
+            return  # 全部重复
 
         # 追加内容
         header = f"\n## Session {datetime.now().strftime('%H:%M')}\n\n"
         with open(today_file, "a", encoding="utf-8") as f:
-            f.write(header + '\n'.join(new_lines) + "\n")
+            f.write(header + '\n'.join(new_items) + "\n")
 
         # 同步到数据库
         if self.memory_manager:
@@ -260,3 +282,15 @@ class MemoryFlusher:
                 self.memory_manager.sync_from_files()
             except Exception:
                 pass
+
+    @staticmethod
+    def _cosine_similarity(vec1, vec2):
+        """计算余弦相似度"""
+        if len(vec1) != len(vec2):
+            return 0.0
+        dot = sum(a * b for a, b in zip(vec1, vec2))
+        norm1 = sum(a * a for a in vec1) ** 0.5
+        norm2 = sum(b * b for b in vec2) ** 0.5
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        return dot / (norm1 * norm2)
